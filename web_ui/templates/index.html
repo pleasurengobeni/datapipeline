@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ETL Manager</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('hybrid_jobs') }}">&#9889; Hybrid Jobs</a>
+      <a href="{{ url_for('catalog') }}">&#128218; Catalog</a>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>Dashboard</h1>
+    </div>
+
+    <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;">
+
+      <div class="card" style="text-align:center;padding:28px 16px;">
+        <div style="font-size:32px;font-weight:700;color:#7c3aed;">{{ hybrid_count | default(0) }}</div>
+        <div style="color:#6b7a90;font-size:12px;margin-top:4px;">Hybrid Jobs</div>
+        <div style="color:#9ca3af;font-size:11px;margin-top:2px;">
+          &#128196; {{ hybrid_file_count | default(0) }} File &middot;
+          &#128421; {{ hybrid_db_count | default(0) }} DB &middot;
+          &#127760; {{ hybrid_api_count | default(0) }} API
+        </div>
+        <a class="btn btn-primary" href="{{ url_for('hybrid_jobs') }}" style="margin-top:14px;">View Jobs</a>
+      </div>
+
+      <div class="card" style="text-align:center;padding:28px 16px;">
+        <div style="font-size:32px;font-weight:700;color:#1e70bf;">{{ user_count if user_count is defined else '—' }}</div>
+        <div style="color:#6b7a90;font-size:12px;margin-top:4px;">Users</div>
+        {% if user[2] %}
+        <a class="btn btn-secondary" href="{{ url_for('users') }}" style="margin-top:14px;">Manage</a>
+        {% endif %}
+      </div>
+
+    </div>
+
+    <div style="margin-top:24px;display:flex;gap:12px;flex-wrap:wrap;">
+      <a class="btn btn-primary" href="{{ url_for('new_hybrid_job') }}">&#9889; + New Job (File / DB / API)</a>
+    </div>
+
+    {% if (db_count | default(0)) > 0 or (file_count | default(0)) > 0 %}
+    <div style="margin-top:28px;padding-top:18px;border-top:1px solid #e5e7eb;">
+      <div style="color:#9ca3af;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;">
+        Legacy job types — no longer created here, existing ones still run and stay editable
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;">
+        {% if (db_count | default(0)) > 0 %}
+        <a class="btn btn-secondary" href="{{ url_for('jobs') }}">&#128257; DB Jobs ({{ db_count }})</a>
+        {% endif %}
+        {% if (file_count | default(0)) > 0 %}
+        <a class="btn btn-secondary" href="{{ url_for('file_jobs') }}">&#128196; File Jobs ({{ file_count }})</a>
+        {% endif %}
+      </div>
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+</body>
+</html>

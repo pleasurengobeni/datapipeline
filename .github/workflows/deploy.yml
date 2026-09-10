@@ -1,0 +1,39 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync to deployment directory
+        run: |
+          rsync -rl --no-owner --no-group --omit-dir-times \
+            --exclude='.git' \
+            --exclude='dags/config/' \
+            --exclude='dags/etl/' \
+            --exclude='dags/sql/' \
+            --exclude='web_ui/webui.db' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            "$GITHUB_WORKSPACE/" /home/cenfri/datapipeline/airflow/
+
+      - name: Rebuild images if needed
+        working-directory: /home/cenfri/datapipeline/airflow
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || true)
+          TRIGGERS="Dockerfile requirements.txt analytics/Dockerfile web_ui/Dockerfile data_pipeline_monitor/Dockerfile"
+          for f in $TRIGGERS; do
+            if echo "$CHANGED" | grep -qF "$f"; then
+              make build
+              break
+            fi
+          done
+
+      - name: Redeploy stack
+        working-directory: /home/cenfri/datapipeline/airflow
+        run: make up

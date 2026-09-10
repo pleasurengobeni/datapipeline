@@ -1,0 +1,1326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ 'Edit' if config else 'New' }} File ETL Job</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+  <style>
+    .env-banner { display:flex; align-items:center; gap:8px; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; margin-bottom:14px; }
+    .env-banner.dev  { background:#dcfce7; color:#15803d; border:1px solid #86efac; }
+    .env-banner.prod { background:#fef9c3; color:#92400e; border:1px solid #fde68a; }
+    .env-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .env-banner.dev  .env-dot { background:#22c55e; }
+    .env-banner.prod .env-dot { background:#f59e0b; }
+    .file-badge { display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:700; background:#f0fdf4; color:#166534; border:1px solid #86efac; margin-bottom:8px; }
+    .hint-block { background:#fffbeb; border:1px solid #fde68a; border-radius:6px; padding:10px 14px; font-size:12px; color:#92400e; margin-bottom:14px; line-height:1.6; }
+    /* Column type editor */
+    .col-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .col-table th { background:#f3f4f6; padding:7px 10px; text-align:left; font-weight:600; color:#374151; border-bottom:2px solid #e5e7eb; }
+    .col-table td { padding:7px 10px; border-bottom:1px solid #f0f0f0; vertical-align:middle; }
+    .col-table tr:hover td { background:#f9fafb; }
+    .col-table select { font-size:11px; padding:3px 6px; border-radius:4px; border:1px solid #d1d5db; background:#fff; }
+    .col-sample { color:#9ca3af; font-size:10px; font-style:italic; }
+
+    .preview-btn { display:inline-flex; align-items:center; gap:6px; padding:7px 14px; background:#6366f1; color:#fff; border:none; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; }
+    .preview-btn:hover { background:#4f46e5; }
+    .preview-upload { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
+    #previewStatus { font-size:12px; color:#6b7a90; }
+    #previewStatus.ok  { color:#15803d; }
+    #previewStatus.err { color:#b91c1c; }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('catalog') }}">&#128218; Catalog</a>
+      <a href="{{ url_for('profile') }}">Profile</a>
+    </div>
+  </nav>
+
+  <main class="main-content" style="padding:24px;max-width:1100px;margin:0 auto;width:100%;">
+    <div class="page-header">
+      <div style="font-size:12px;color:#6b7a90;margin-bottom:4px;">&#128196; File-Based ETL</div>
+      <h1>{{ 'Edit File Job' if config else 'Add a New File ETL Job' }}</h1>
+    </div>
+
+    {# ── Environment banner ── #}
+    {% if active_env == 'dev' %}
+    <div class="env-banner dev"><span class="env-dot"></span> Editing <strong>DEV</strong> environment only &mdash; prod fields are preserved from the saved config.</div>
+    {% elif active_env == 'prod' %}
+    <div class="env-banner prod"><span class="env-dot"></span> Editing <strong>PROD</strong> environment only &mdash; dev fields are preserved from the saved config.</div>
+    {% endif %}
+
+    {# ── JS / backend validation error banner ── #}
+    <div id="saveErrorBanner" style="display:none;margin-bottom:14px;padding:12px 16px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#b91c1c;font-size:13px;font-weight:600;"></div>
+    {% if save_error %}
+    <div style="margin-bottom:14px;padding:12px 16px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#b91c1c;font-size:13px;font-weight:600;">
+      &#9888; Save failed: {{ save_error }}
+    </div>
+    {% endif %}
+
+    <div class="hint-block">
+      &#9432; <strong>File-based ETL</strong> — drop CSV or Parquet files into a folder on the Airflow worker.
+      This pipeline reads the file, cleans column names, handles encoding &amp; nulls, then loads data into the target DB.
+      Non-ASCII characters are stripped. Numeric/date columns are safely coerced with null guards.
+    </div>
+
+    <form method="post" action="{{ url_for('new_file_job') if not config else url_for('edit_file_job', dag_id=config.dag_id) }}" id="jobForm">
+
+      {# ── Preserve the OTHER env's hidden fields when editing env-scoped ── #}
+      {% if config and config.get('spark') and active_env %}
+        <input type="hidden" name="_existing_spark_master"           value="{{ config.spark.master or 'local[*]' }}" />
+        <input type="hidden" name="_existing_spark_app_name"         value="{{ config.spark.app_name or '' }}" />
+        <input type="hidden" name="_existing_spark_driver_memory"    value="{{ config.spark.driver_memory or '1g' }}" />
+        <input type="hidden" name="_existing_spark_executor_memory"  value="{{ config.spark.executor_memory or '2g' }}" />
+        <input type="hidden" name="_existing_spark_executor_cores"   value="{{ config.spark.executor_cores or 2 }}" />
+        <input type="hidden" name="_existing_spark_num_executors"    value="{{ config.spark.num_executors or 2 }}" />
+      {% endif %}
+
+      {% if active_env == 'dev' and config %}
+        {# preserve prod source #}
+        <input type="hidden" name="prod_watch_path"        value="{{ config.source.prod.watch_path or incoming_dir }}" />
+        <input type="hidden" name="prod_file_name"          value="" />
+        <input type="hidden" name="prod_archive_path"       value="{{ config.source.prod.archive_path or archive_dir }}" />
+        <input type="hidden" name="prod_archive_retention_days" value="{{ config.source.prod.archive_retention_days or 30 }}" />
+        <input type="hidden" name="prod_file_format"       value="{{ config.source.prod.file_format or 'csv' }}" />
+        <input type="hidden" name="prod_delimiter"         value="{{ config.source.prod.delimiter or ',' }}" />
+        <input type="hidden" name="prod_encoding"          value="auto" />
+        <input type="hidden" name="prod_has_header"        value="{{ 'on' if config.source.prod.has_header else '' }}" />
+        <input type="hidden" name="prod_skip_rows"         value="{{ config.source.prod.skip_rows or 0 }}" />
+        <input type="hidden" name="prod_date_columns"      value="{{ config.source.prod.date_columns | join(',') if config.source.prod.date_columns else '' }}" />
+        <input type="hidden" name="prod_null_values"       value="{{ config.source.prod.null_values | join(',') if config.source.prod.null_values else '' }}" />
+        {# preserve prod target #}
+        <input type="hidden" name="prod_target_db_conn_id" value="{{ config.target.prod.target_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_target_db_type"    value="{{ config.target.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_target_schema"     value="{{ config.target.prod.target_schema or '' }}" />
+        <input type="hidden" name="prod_target_table"      value="{{ config.target.prod.target_table or '' }}" />
+      {% elif active_env == 'prod' and config %}
+        {# preserve dev source #}
+        <input type="hidden" name="dev_watch_path"         value="{{ config.source.dev.watch_path or incoming_dir }}" />
+        <input type="hidden" name="dev_file_name"           value="" />
+        <input type="hidden" name="dev_archive_path"        value="{{ config.source.dev.archive_path or archive_dir }}" />
+        <input type="hidden" name="dev_archive_retention_days" value="{{ config.source.dev.archive_retention_days or 30 }}" />
+        <input type="hidden" name="dev_file_format"        value="{{ config.source.dev.file_format or 'csv' }}" />
+        <input type="hidden" name="dev_delimiter"          value="{{ config.source.dev.delimiter or ',' }}" />
+        <input type="hidden" name="dev_encoding"           value="auto" />
+        <input type="hidden" name="dev_has_header"         value="{{ 'on' if config.source.dev.has_header else '' }}" />
+        <input type="hidden" name="dev_skip_rows"          value="{{ config.source.dev.skip_rows or 0 }}" />
+        <input type="hidden" name="dev_date_columns"       value="{{ config.source.dev.date_columns | join(',') if config.source.dev.date_columns else '' }}" />
+        <input type="hidden" name="dev_null_values"        value="{{ config.source.dev.null_values | join(',') if config.source.dev.null_values else '' }}" />
+        {# preserve dev target #}
+        <input type="hidden" name="dev_target_db_conn_id"  value="{{ config.target.dev.target_db_conn_id or '' }}" />
+        <input type="hidden" name="dev_target_db_type"     value="{{ config.target.dev.db_type or 'postgresql' }}" />
+        <input type="hidden" name="dev_target_schema"      value="{{ config.target.dev.target_schema or '' }}" />
+        <input type="hidden" name="dev_target_table"       value="{{ config.target.dev.target_table or '' }}" />
+      {% endif %}
+
+      <!-- Step Tabs -->
+      <div class="step-tabs" id="stepTabs">
+        <div class="step-tab active" data-idx="0">1. File Source</div>
+        <div class="step-tab"        data-idx="1">2. Basics</div>
+        <div class="step-tab"        data-idx="2">3. Column Types</div>
+        <div class="step-tab"        data-idx="3">4. Target</div>
+        <div class="step-tab"        data-idx="4">5. Dictionary</div>
+        <div class="step-tab"        data-idx="5">6. Review</div>
+      </div>
+
+      <!-- ── STEP 1: File Source ── -->
+      <div class="card form-step" data-step="0">
+        <div class="card-title">File Source Configuration</div>
+
+        {# ── Quick-fill from server filename ── #}
+        <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+          <div style="font-weight:600;color:#0369a1;margin-bottom:6px;">&#128196; Enter the filename — fields will auto-fill and columns will be previewed from the file on the server</div>
+          <div style="color:#0369a1;font-size:11px;margin-bottom:10px;">Place your CSV or Parquet file in the <code>incoming</code> folder on the server before using this wizard.</div>
+          <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;">
+            <div style="flex:1;min-width:200px;position:relative;">
+              <input type="text" id="sampleFileInput" placeholder="Type to filter files…"
+                     value="{{ config.source.dev.file_name if config else '' }}"
+                     style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #93c5fd;border-radius:6px;font-size:13px;transition:border-color .2s;"
+                     autocomplete="off" />
+              <div id="fileDropdown" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:999;
+                   background:#fff;border:1px solid #93c5fd;border-top:none;border-radius:0 0 6px 6px;
+                   max-height:200px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.1);"></div>
+              <div id="incomingDirNote" style="display:none;font-size:11px;color:#64748b;margin-top:3px;"></div>
+            </div>
+            <button type="button" class="preview-btn" id="runPreviewBtn" style="white-space:nowrap;margin-top:1px;">&#128269; Check &amp; Preview Columns</button>
+            <span id="previewStatus" style="margin-top:6px;"></span>
+          </div>
+          <div id="fileInputError" style="display:none;color:#dc2626;font-size:12px;margin-top:4px;"></div>
+          <div id="autoFillNote" style="display:none;margin-top:8px;font-size:11px;color:#0369a1;">&#10003; Auto-filled from filename — edit any field below to override.</div>
+        </div>
+
+        <div class="form-grid">
+
+          {# ── DEV file source ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">File Source — Dev</div>
+
+          <div class="form-field">
+            <label>File Format</label>
+            <select name="dev_file_format" id="devFileFormat">
+              {% for fmt in ['csv', 'parquet'] %}
+              <option value="{{ fmt }}" {% if config and config.source.dev.file_format == fmt %}selected{% endif %}>{{ fmt|upper }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          {# These are hardcoded — not shown to the user #}
+          <input type="hidden" id="devWatchPath" name="dev_watch_path" value="{{ incoming_dir }}" />
+          <input type="hidden" id="devFileName"  name="dev_file_name"  value="" />
+          <input type="hidden" id="devArchivePath" name="dev_archive_path" value="{{ archive_dir }}" />
+
+          <div class="form-field">
+            <label>Archive Retention (days)</label>
+            <input name="dev_archive_retention_days" type="number" min="1"
+                   value="{{ config.source.dev.archive_retention_days if config else 30 }}" />
+            <span class="field-hint">Default: 30 days.</span>
+          </div>
+
+          {# CSV-specific fields — shown/hidden by JS #}
+          <div class="form-field dev-csv-field">
+            <label>Delimiter</label>
+            {% set _dev_del = config.source.dev.delimiter if config else ',' %}
+            <select name="dev_delimiter" id="devDelimiter">
+              <option value=","  {% if _dev_del == ',' %}selected{% endif %}>, — Comma</option>
+              <option value="\t" {% if _dev_del == '\t' or _dev_del == '\\t' %}selected{% endif %}>\t — Tab (TSV)</option>
+              <option value=";"  {% if _dev_del == ';' %}selected{% endif %}>; — Semicolon</option>
+              <option value="|"  {% if _dev_del == '|' %}selected{% endif %}>| — Pipe</option>
+              <option value=" "  {% if _dev_del == ' ' %}selected{% endif %}>  — Space</option>
+            </select>
+          </div>
+
+          <input type="hidden" name="dev_encoding" value="auto" />
+
+          <div class="form-field dev-csv-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="dev_has_header" id="devHasHeader"
+                       {% if not (config and config.source.dev.has_header == False) %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label for="devHasHeader">Has Header Row</label>
+            </div>
+          </div>
+
+          <div class="form-field dev-csv-field">
+            <label>Skip Rows</label>
+            <input name="dev_skip_rows" type="number" min="0" value="{{ config.source.dev.skip_rows if config else 0 }}" />
+            <span class="field-hint">Rows to skip before the header.</span>
+          </div>
+
+          {# date_columns is derived automatically from Column Types step (columns typed as date/timestamp) #}
+          <input type="hidden" id="devDateColumns" name="dev_date_columns"
+                 value="{{ config.source.dev.date_columns | join(',') if config and config.source.dev.date_columns else '' }}" />
+          <input type="hidden" id="devColumnNames" name="dev_column_names"
+                 value="{{ config.source.dev.column_names | join(',') if config and config.source.dev.column_names else (config.source.dev.dtype_overrides.keys() | join(',') if config and config.source.dev.dtype_overrides else '') }}" />
+
+          <div class="form-field span-3">
+            <label>Null Value Sentinels (comma-separated)</label>
+            {% if config and config.source.dev.null_values %}
+            <input name="dev_null_values"
+                   value="{{ config.source.dev.null_values | join(',') }}"
+                   placeholder="NULL,null,None,NA,N/A,#N/A" />
+            {% else %}
+            <input name="dev_null_values"
+                   value="NULL,null,None,NA,N/A,#N/A"
+                   placeholder="NULL,null,None,NA,N/A,#N/A"
+                   data-default-clear="1"
+                   onfocus="if(this.getAttribute('data-default-clear')){this.value='';this.removeAttribute('data-default-clear')}" />
+            {% endif %}
+            <span class="field-hint">Cells matching these are treated as NULL. Click to clear defaults and enter your own.</span>
+          </div>
+
+          <div class="form-field span-3" style="color:#6b7a90;font-size:11px;background:#f8f9fc;border:1px solid #e2e6ee;border-radius:6px;padding:10px 14px;">
+            &#8505; <strong>Idempotency:</strong> Duplicate loads are prevented automatically using <strong>MD5 checksum</strong>.
+          </div>
+          {% endif %}
+
+          {# ── PROD file source ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">File Source — Prod</div>
+
+          <div class="form-field">
+            <label>File Format</label>
+            <select name="prod_file_format" id="prodFileFormat">
+              {% for fmt in ['csv', 'parquet'] %}
+              <option value="{{ fmt }}" {% if config and config.source.prod.file_format == fmt %}selected{% endif %}>{{ fmt|upper }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <input type="hidden" name="prod_watch_path"   value="{{ incoming_dir }}" />
+          <input type="hidden" name="prod_file_name"    value="" />
+          <input type="hidden" name="prod_archive_path" value="{{ archive_dir }}" />
+
+          <div class="form-field">
+            <label>Archive Retention (days)</label>
+            <input name="prod_archive_retention_days" type="number" min="1"
+                   value="{{ config.source.prod.archive_retention_days if config else 30 }}" />
+          </div>
+
+          <div class="form-field prod-csv-field">
+            <label>Delimiter</label>
+            {% set _prod_del = config.source.prod.delimiter if config else ',' %}
+            <select name="prod_delimiter" id="prodDelimiter">
+              <option value=","  {% if _prod_del == ',' %}selected{% endif %}>, — Comma</option>
+              <option value="\t" {% if _prod_del == '\t' or _prod_del == '\\t' %}selected{% endif %}>\t — Tab (TSV)</option>
+              <option value=";"  {% if _prod_del == ';' %}selected{% endif %}>; — Semicolon</option>
+              <option value="|"  {% if _prod_del == '|' %}selected{% endif %}>| — Pipe</option>
+              <option value=" "  {% if _prod_del == ' ' %}selected{% endif %}>  — Space</option>
+            </select>
+          </div>
+
+          <input type="hidden" name="prod_encoding" value="auto" />
+
+          <div class="form-field prod-csv-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="prod_has_header" id="prodHasHeader"
+                       {% if not (config and config.source.prod.has_header == False) %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label for="prodHasHeader">Has Header Row</label>
+            </div>
+          </div>
+
+          <div class="form-field prod-csv-field">
+            <label>Skip Rows</label>
+            <input name="prod_skip_rows" type="number" min="0" value="{{ config.source.prod.skip_rows if config else 0 }}" />
+          </div>
+
+          {# prod_date_columns is derived automatically from Column Types step #}
+          <input type="hidden" name="prod_date_columns"
+                 value="{{ config.source.prod.date_columns | join(',') if config and config.source.prod.date_columns else '' }}" />
+          <input type="hidden" name="prod_column_names"
+                 value="{{ config.source.prod.column_names | join(',') if config and config.source.prod.column_names else (config.source.prod.dtype_overrides.keys() | join(',') if config and config.source.prod.dtype_overrides else '') }}" />
+
+          <div class="form-field span-3">
+            <label>Null Value Sentinels (comma-separated)</label>
+            {% if config and config.source.prod.null_values %}
+            <input name="prod_null_values"
+                   value="{{ config.source.prod.null_values | join(',') }}"
+                   placeholder="NULL,null,None,NA,N/A,#N/A" />
+            {% else %}
+            <input name="prod_null_values"
+                   value="NULL,null,None,NA,N/A,#N/A"
+                   placeholder="NULL,null,None,NA,N/A,#N/A"
+                   data-default-clear="1"
+                   onfocus="if(this.getAttribute('data-default-clear')){this.value='';this.removeAttribute('data-default-clear')}" />
+            {% endif %}
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 2: Basics ── -->
+      <div class="card form-step" data-step="1">
+        <div class="card-title">Job Basics</div>
+        <div class="form-grid">
+
+          <div class="form-field">
+            <label>DAG ID *</label>
+            <input name="dag_id" id="dagIdInput" value="{{ bare_dag_id if bare_dag_id is defined else (config.dag_id if config else '') }}" required placeholder="e.g. winequality_red" />
+            <p class="hint">Prefix is added automatically: <code>File_csv_</code> / <code>File_parquet_</code> / <code>Spark_File_csv_</code> / <code>Spark_File_parquet_</code></p>
+            <span class="field-hint">Auto-filled from filename — edit to customise.</span>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule — pick preset</label>
+            <select id="schedulePicker">
+              <option value="">— select a preset —</option>
+              {% for lbl, cron in schedule_suggestions %}
+              <option value="{{ cron }}">{{ lbl }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule Interval (cron)</label>
+            <input id="scheduleInterval" name="schedule_interval"
+                   value="{{ (config.schedule_interval or '') if config else '' }}"
+                   placeholder="@once  or  0 2 * * *" />
+          </div>
+
+          <div class="form-field span-2">
+            <label>Additional Tags (comma-separated)</label>
+            <input name="extra_tags"
+                   value="{{ extra_tags_str if extra_tags_str is defined else '' }}"
+                   placeholder="e.g. finance, manual-dump" />
+            <span class="field-hint">Your username is always included automatically.</span>
+          </div>
+
+          <div class="form-field" style="display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:6px;">
+            <label>Current Tags</label>
+            <div class="tags-row">
+              {% if current_username %}<span class="tag tag-owner">{{ current_username }}</span>{% endif %}
+              {% for t in existing_tags[1:] %}<span class="tag">{{ t }}</span>{% endfor %}
+            </div>
+          </div>
+
+          <input type="hidden" name="created_by" value="{{ current_username }}" />
+          <input type="hidden" name="pipeline_type" value="file_based" />
+
+        </div>
+
+        {# "Same as dev" toggle #}
+        {% if active_env %}
+        <input type="hidden" name="apply_prod_same_as_dev" value="on" />
+        {% else %}
+        <div class="toggle-field">
+          <label class="toggle-switch">
+            <input type="checkbox" name="apply_prod_same_as_dev" id="sameAsDev" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="sameAsDev">Use same settings for Prod as Dev</label>
+        </div>
+        {% endif %}
+
+        {# ── Spark engine toggle ── #}
+        <div class="toggle-field" style="margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="use_spark" id="useSpark"
+                   {% if config and config.get('spark') %}checked{% endif %} />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="useSpark" style="font-weight:600;">
+            &#9889; Run on <strong>Spark</strong>
+            <span style="font-weight:400;color:#6b7a90;font-size:11px;margin-left:6px;">— uses PySpark instead of Pandas for large files</span>
+          </label>
+        </div>
+
+        {# ── Spark panel ── #}
+        <div id="sparkConfigPanel" style="display:none;background:#f0f7ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px;margin-top:14px;">
+          <div style="font-weight:600;color:#1e40af;margin-bottom:12px;">&#9889; Spark Configuration</div>
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Spark Master</label>
+              <input name="spark_master" value="{{ config.spark.master if config and config.get('spark') else 'local[*]' }}" placeholder="local[*]" />
+              <span class="field-hint">local[*] for local mode; spark://host:7077 for cluster</span>
+            </div>
+            <div class="form-field">
+              <label>App Name</label>
+              <input name="spark_app_name" value="{{ config.spark.app_name if config and config.get('spark') else '' }}" placeholder="my_file_etl" />
+            </div>
+            <div class="form-field">
+              <label>Driver Memory</label>
+              <input name="spark_driver_memory" value="{{ config.spark.driver_memory if config and config.get('spark') else '1g' }}" placeholder="1g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Memory</label>
+              <input name="spark_executor_memory" value="{{ config.spark.executor_memory if config and config.get('spark') else '2g' }}" placeholder="2g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Cores</label>
+              <input name="spark_executor_cores" type="number" min="1" value="{{ config.spark.executor_cores if config and config.get('spark') else 2 }}" />
+            </div>
+            <div class="form-field">
+              <label>Num Executors</label>
+              <input name="spark_num_executors" type="number" min="1" value="{{ config.spark.num_executors if config and config.get('spark') else 2 }}" />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── STEP 3: Column Types ── -->
+      <div class="card form-step" data-step="2">
+        <div class="card-title">Column Types &amp; Preview</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+          Columns detected from your file are shown below. Adjust types before saving.
+          These become <code>dtype_overrides</code> in the generated DAG config.
+        </p>
+
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap;">
+          <button type="button" class="preview-btn" id="refreshColumnsBtn">&#8635; Re-detect Columns</button>
+          <button type="button" id="aiTypesBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#127775; AI Suggest Types</button>
+          <span id="colTabStatus"></span>
+          <span id="aiTypesStatus" style="font-size:12px;"></span>
+          <span id="detectedDelimBadge" style="display:none;background:#d1fae5;color:#065f46;border:1px solid #6ee7b7;border-radius:6px;padding:2px 10px;font-size:11px;font-weight:600;"></span>
+        </div>
+        <p style="color:#6b7a90;font-size:11px;margin-top:-8px;margin-bottom:10px;">
+          &#128274; AI only receives column names &amp; the table name — never your actual data values.
+        </p>
+
+        <div id="colPreviewWrap" style="display:none;">
+          <table class="col-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Original Name</th>
+                <th>Cleaned Name</th>
+                <th>Suggested Type</th>
+                <th>Override Type</th>
+                <th>Sample Values</th>
+              </tr>
+            </thead>
+            <tbody id="colPreviewBody"></tbody>
+          </table>
+          <p style="margin-top:10px;font-size:11px;color:#6b7a90;">
+            &#128161; Changes here update <strong>dtype_overrides</strong> in your config. Columns set to <em>text</em> receive no cast.
+            Skip this step to use auto-inference only.
+            <br>&#128197; Columns typed as <strong>date</strong> or <strong>timestamp</strong> are automatically added to <code>date_columns</code> for date parsing — no separate field needed.
+          </p>
+        </div>
+
+        {# Hidden fields that carry dtype_overrides JSON to the backend #}
+        <input type="hidden" name="dev_dtype_overrides_json" id="devDtypeOverridesJson"
+               value="{{ config.source.dev.dtype_overrides | tojson if config and config.source.dev.dtype_overrides else '{}' }}" />
+        <input type="hidden" name="prod_dtype_overrides_json" id="prodDtypeOverridesJson"
+               value="{{ config.source.prod.dtype_overrides | tojson if config and config.source.prod.dtype_overrides else '{}' }}" />
+        {# HWM not used for file loads — preserved in saved config but not editable here #}
+        <input type="hidden" name="dev_hwm_column" id="devHwmColumn" value="[]" />
+        <input type="hidden" name="prod_hwm_column" id="prodHwmColumn" value="[]" />
+      </div>
+
+      <!-- ── STEP 4: Target ── -->
+      <div class="card form-step" data-step="3">
+        <div class="card-title">Target DB Configuration</div>
+        <div class="form-grid">
+
+          {# ── DEV target ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Target — Dev</div>
+
+          <div class="form-field">
+            <label>Connection ID *</label>
+            <select name="dev_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.dev.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div></div>{# spacer — pushes schema+table to start of a new row #}
+
+          <div class="form-field">
+            <label>Target Schema *</label>
+            <input name="dev_target_schema" value="{{ config.target.dev.target_schema if config else '' }}" placeholder="e.g. public" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table *</label>
+            <input name="dev_target_table" value="{{ config.target.dev.target_table if config else '' }}" placeholder="e.g. entity_data" />
+          </div>
+          {% endif %}
+
+          {# ── PROD target ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Target — Prod</div>
+
+          <div class="form-field">
+            <label>Connection ID *</label>
+            <select name="prod_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.prod.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div></div>{# spacer — pushes schema+table to start of a new row #}
+
+          <div class="form-field">
+            <label>Target Schema *</label>
+            <input name="prod_target_schema" value="{{ config.target.prod.target_schema if config else '' }}" placeholder="e.g. public" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table *</label>
+            <input name="prod_target_table" value="{{ config.target.prod.target_table if config else '' }}" placeholder="e.g. entity_data" />
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 5: Data Dictionary ── -->
+      <div class="card form-step" data-step="4">
+        <div class="card-title">&#128218; Data Dictionary</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+          Describe each column in the target table. These are auto-detected from your file and can be
+          edited here. Stored in the config JSON and shown on the
+          <a href="{{ url_for('catalog') }}" target="_blank">Data Catalog</a>.
+        </p>
+
+        <!-- Table description -->
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">Table Description</label>
+          <div style="display:flex;gap:8px;align-items:flex-start;">
+            <textarea name="table_description" id="tableDescInput"
+              rows="2"
+              placeholder="Briefly describe what this table contains and its business purpose…"
+              style="flex:1;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;resize:vertical;line-height:1.5;font-family:inherit;">{{ table_description_val | default('') }}</textarea>
+            <button type="button" id="suggestTableDescBtn"
+              title="Let AI write a description based on the table name and columns"
+              style="display:inline-flex;align-items:center;gap:5px;padding:7px 12px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#127775; AI Fill</button>
+          </div>
+          <span id="tableDescStatus" style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;"></span>
+        </div>
+
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">
+            Business Date Column <span style="font-weight:400;color:#6b7a90;">(optional)</span>
+          </label>
+          <input name="business_date_column" id="businessDateColumn"
+            value="{{ business_date_column_val | default('') }}"
+            placeholder="e.g. report_date, invoice_date, reading_datetime"
+            style="width:100%;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-family:inherit;" />
+          <span style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;">
+            The column that says how current the data itself is — shown as
+            <strong>Business Date</strong> on the monitoring dashboard.
+          </span>
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+          <button type="button" id="addDdRow" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#10b981;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">+ Add Column</button>
+          <button type="button" id="fromColumnsBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#0ea5e9;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#8635; Load from Detected Columns</button>
+          <button type="button" id="suggestAiBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#127775; Suggest with AI</button>
+          <span id="aiStatus" style="font-size:12px;color:#6b7a90;"></span>
+        </div>
+        <table class="col-table" id="ddTable">
+          <thead>
+            <tr>
+              <th style="width:25%;">Column Name</th>
+              <th style="width:13%;">Data Type</th>
+              <th>Description</th>
+              <th style="width:38px;"></th>
+            </tr>
+          </thead>
+          <tbody id="ddBody"></tbody>
+        </table>
+
+      </div>
+
+      <!-- ── STEP 6: Review ── -->
+      <div class="card form-step" data-step="5">
+        <div class="card-title">Review &amp; Save</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:12px;">Review your settings, then click <strong>Save</strong>.</p>
+        <div id="reviewSummary" style="font-size:12px;line-height:1.9;color:#444;"></div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="form-actions">
+        <button class="btn btn-secondary" type="button" id="prevBtn">&#8592; Back</button>
+        <button class="btn btn-primary"   type="button" id="nextBtn">Next &#8594;</button>
+        <button class="btn btn-primary"   type="submit"  id="saveBtn">&#10003; Save</button>
+        <a      class="btn btn-secondary" href="{{ url_for('file_jobs') }}">&#10005; Cancel</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+
+<script>
+  const steps   = Array.from(document.querySelectorAll('.form-step'));
+  const tabs    = Array.from(document.querySelectorAll('.step-tab'));
+  const nextBtn = document.getElementById('nextBtn');
+  const prevBtn = document.getElementById('prevBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  let current = 0;
+
+  function renderStep() {
+    steps.forEach((s, i) => s.style.display = i === current ? 'block' : 'none');
+    tabs.forEach((t, i)  => t.classList.toggle('active', i === current));
+    prevBtn.style.display = current === 0 ? 'none' : 'inline-flex';
+    nextBtn.style.display = current === steps.length - 1 ? 'none' : 'inline-flex';
+    saveBtn.style.display = current === steps.length - 1 ? 'inline-flex' : 'none';
+    if (current === steps.length - 1) buildReview();
+  }
+
+  function buildReview() {
+    const dagEl      = document.getElementById('dagIdInput');
+    const dagId      = dagEl ? dagEl.value : '';
+    const sched      = document.getElementById('scheduleInterval');
+    const sparkEl    = document.getElementById('useSpark');
+    const useSpark   = sparkEl ? sparkEl.checked : false;
+    const devFmt     = document.querySelector('[name=dev_file_format]');
+    const devPath    = document.getElementById('devWatchPath');
+    const devSchema  = document.querySelectorAll('[name=dev_target_schema]');
+    const devTable   = document.querySelectorAll('[name=dev_target_table]');
+    const overEl     = document.getElementById('devDtypeOverridesJson');
+    let overrideCount = 0;
+    try { overrideCount = Object.keys(JSON.parse(overEl ? overEl.value : '{}')).length; } catch(e) {}
+    const schemaVal = devSchema.length ? devSchema[devSchema.length-1].value : '';
+    const tableVal  = devTable.length  ? devTable[devTable.length-1].value   : '';
+    document.getElementById('reviewSummary').innerHTML =
+      '<b>DAG ID:</b> '          + (dagId || '—') + '<br>' +
+      '<b>Schedule:</b> '        + (sched ? sched.value : '—') + '<br>' +
+      '<b>Engine:</b> '          + (useSpark ? '&#9889; Spark' : '&#128040; Pandas') + '<br>' +
+      '<b>Pipeline Type:</b> File-Based ETL &#128196;<br>' +
+      (overrideCount ? '<b>Column Overrides:</b> ' + overrideCount + ' column(s)<br>' : '') +
+      (devFmt  ? '<b>File Format:</b> '    + devFmt.value.toUpperCase() + '<br>' : '') +
+      (schemaVal && tableVal ? '<b>Target:</b> ' + schemaVal + '.' + tableVal + '<br>' : '');
+  }
+
+  tabs.forEach(t => t.addEventListener('click', () => {
+    current = parseInt(t.dataset.idx);
+    renderStep();
+  }));
+
+  nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; renderStep(); } });
+  prevBtn.addEventListener('click', () => { if (current > 0) { current--; renderStep(); } });
+
+  // ── Auto-populate fields from picked filename ────────────────────────────
+  // ── DAG ID prefix based on engine + format ────────────────────────────────
+  function getDagPrefix() {
+    const sparkEl = document.getElementById('useSpark');
+    const fmtEl   = document.getElementById('devFileFormat');
+    const spark   = sparkEl && sparkEl.checked;
+    const fmt     = fmtEl ? fmtEl.value : 'csv';
+    return (spark ? 'Spark_File_' : 'File_') + fmt + '_';
+  }
+
+  function stripDagPrefix(val) {
+    return val.replace(/^(Spark_File_|File_)(csv|parquet)_/i, '');
+  }
+
+  function applyDagPrefix() {
+    const dagEl = document.getElementById('dagIdInput');
+    if (!dagEl) return;
+    const bare   = stripDagPrefix(dagEl.value);
+    const prefix = getDagPrefix();
+    dagEl.value  = bare ? prefix + bare : '';
+  }
+
+  function autoFillFromFilename(filename) {
+    const parts  = filename.replace(/\.[^.]+$/, '');           // strip extension
+    const ext    = (filename.match(/\.([^.]+)$/) || [])[1] || 'csv';
+    const fmt    = ext.toLowerCase() === 'parquet' ? 'parquet' : 'csv';
+
+    // Use the full stem — just sanitise to a safe identifier (keep digits, letters, underscores)
+    const bare   = parts.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+    const prefix = getDagPrefix();
+    const dagId  = prefix + bare;
+    const tableName = bare;
+
+    // Fill DAG ID — always overwrite so it stays in sync with the full filename
+    const dagEl = document.getElementById('dagIdInput');
+    if (dagEl) dagEl.value = dagId;
+
+    // Watch path, file name, archive path, and encoding are hardcoded — no need to auto-fill
+    // Keep devFileName in sync with whatever is typed in the picker text box
+    const fnEl = document.getElementById('devFileName');
+    if (fnEl) fnEl.value = filename;
+
+    // Fill file format (step 1)
+    const fmtEl = document.getElementById('devFileFormat');
+    if (fmtEl) {
+      fmtEl.value = fmt;
+      syncCsvFields(fmtEl, 'dev-csv-field');
+    }
+    const prodFmtEl = document.getElementById('prodFileFormat');
+    if (prodFmtEl) {
+      prodFmtEl.value = fmt;
+      syncCsvFields(prodFmtEl, 'prod-csv-field');
+    }
+
+    // Fill target table (step 4) — always overwrite to match the filename
+    const tblEls = document.querySelectorAll('[name=dev_target_table]');
+    const tblEl  = tblEls[tblEls.length - 1];
+    if (tblEl) tblEl.value = tableName;
+
+    document.getElementById('autoFillNote').style.display = 'block';
+  }
+
+  // ── Column Preview ──────────────────────────────────────────────
+
+  const DTYPE_OPTIONS = ['text', 'integer', 'decimal', 'boolean', 'timestamp', 'date'];
+
+  function collectDtypeOverrides() {
+    const overrides = {};
+    // Store ALL columns (including text) so edit mode can restore the full column list
+    document.querySelectorAll('[data-col-clean]').forEach(sel => {
+      if (sel.value) overrides[sel.dataset.colClean] = sel.value;
+    });
+    return overrides;
+  }
+
+  function syncDtypeHiddenFields() {
+    const json = JSON.stringify(collectDtypeOverrides());
+    const devEl  = document.getElementById('devDtypeOverridesJson');
+    const prodEl = document.getElementById('prodDtypeOverridesJson');
+    if (devEl)  devEl.value  = json;
+    if (prodEl) prodEl.value = json;
+    // Derive date_columns from columns typed as date or timestamp
+    const dateCols = [];
+    document.querySelectorAll('[data-col-clean]').forEach(sel => {
+      if (sel.value === 'date' || sel.value === 'timestamp') dateCols.push(sel.dataset.colClean);
+    });
+    const dateColsVal = dateCols.join(',');
+    document.querySelectorAll('[name="dev_date_columns"]').forEach(el => el.value = dateColsVal);
+    document.querySelectorAll('[name="prod_date_columns"]').forEach(el => el.value = dateColsVal);
+    // Keep column_names in sync so edit mode can always restore the full ordered list
+    const allColNames = Array.from(document.querySelectorAll('[data-col-clean]')).map(s => s.dataset.colClean).join(',');
+    document.querySelectorAll('[name="dev_column_names"]').forEach(el => el.value = allColNames);
+    document.querySelectorAll('[name="prod_column_names"]').forEach(el => el.value = allColNames);
+  }
+
+  // ── Detected columns registry (populated after preview) ──────────────────
+  let _detectedCleanCols = [];
+
+  function renderColumnTable(columns) {
+    _detectedCleanCols = columns.map(c => c.clean);
+    const tbody = document.getElementById('colPreviewBody');
+    tbody.innerHTML = '';
+    let existing = {};
+    try { existing = JSON.parse(document.getElementById('devDtypeOverridesJson').value || '{}'); } catch(e) {}
+    const _dcEl = document.getElementById('devDateColumns');
+    const _dcSet = new Set((_dcEl ? _dcEl.value : '').split(',').map(s => s.trim()).filter(Boolean));
+    columns.forEach((col, i) => {
+      let override = existing[col.clean] || col.dtype || 'text';
+      if (!existing[col.clean] && _dcSet.has(col.clean)) override = 'timestamp';
+      const opts = DTYPE_OPTIONS.map(dt =>
+        `<option value="${dt}" ${dt === override ? 'selected' : ''}>${dt}</option>`
+      ).join('');
+      const sample = (col.sample || []).join(', ');
+      tbody.innerHTML += `
+        <tr>
+          <td style="color:#9ca3af;font-size:11px;">${i + 1}</td>
+          <td><code style="font-size:11px;">${col.original}</code></td>
+          <td><code style="font-size:11px;color:#6366f1;">${col.clean}</code></td>
+          <td><span style="background:#dbeafe;color:#1e40af;padding:2px 7px;border-radius:10px;font-size:10px;font-weight:700;">${col.dtype || 'text'}</span></td>
+          <td><select data-col-clean="${col.clean}" onchange="syncDtypeHiddenFields()">${opts}</select></td>
+          <td class="col-sample">${sample || '—'}</td>
+        </tr>`;
+    });
+    document.getElementById('colPreviewWrap').style.display = 'block';
+  }
+
+  const runPreviewBtn = document.getElementById('runPreviewBtn');
+
+  function _setFileInputState(ok, msg) {
+    const inp    = document.getElementById('sampleFileInput');
+    const errDiv = document.getElementById('fileInputError');
+    if (!inp) return;
+    if (ok === null) {
+      // reset
+      inp.style.borderColor = '#93c5fd';
+      if (errDiv) { errDiv.style.display = 'none'; errDiv.textContent = ''; }
+    } else if (ok) {
+      inp.style.borderColor = '#16a34a';
+      if (errDiv) { errDiv.style.display = 'none'; errDiv.textContent = ''; }
+    } else {
+      inp.style.borderColor = '#dc2626';
+      if (errDiv) { errDiv.style.display = 'block'; errDiv.textContent = msg || ''; }
+    }
+  }
+
+  // Populate the filename datalist from the server's incoming folder
+  // ── Async file browser dropdown ──────────────────────────────────────────
+  let _incomingFiles = [];
+
+  (function loadIncomingFiles() {
+    // Fetch file list in the background — never blocks the UI
+    fetch('/api/files')
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then(data => {
+        _incomingFiles = data.files || [];
+        const note = document.getElementById('incomingDirNote');
+        if (note && data.incoming_dir) {
+          const count = _incomingFiles.length;
+          note.textContent = 'Incoming folder: ' + data.incoming_dir +
+            ' (' + count + ' file' + (count !== 1 ? 's' : '') + ')';
+          note.style.display = 'block';
+        }
+      })
+      .catch(() => { _incomingFiles = []; });
+  })();
+
+  (function initFileDropdown() {
+    const inp = document.getElementById('sampleFileInput');
+    const dd  = document.getElementById('fileDropdown');
+    if (!inp || !dd) return;
+
+    function showDropdown(items) {
+      dd.innerHTML = '';
+      if (!items.length) { dd.style.display = 'none'; return; }
+      items.forEach(f => {
+        const row = document.createElement('div');
+        row.textContent = f;
+        row.style.cssText = 'padding:7px 11px;cursor:pointer;font-size:13px;border-bottom:1px solid #e0f2fe;';
+        row.addEventListener('mouseenter', () => row.style.background = '#e0f2fe');
+        row.addEventListener('mouseleave', () => row.style.background = '');
+        row.addEventListener('mousedown', e => {
+          e.preventDefault(); // prevent blur before click
+          inp.value = f;
+          dd.style.display = 'none';
+          _setFileInputState(null);
+          autoFillFromFilename(f);
+        });
+        dd.appendChild(row);
+      });
+      dd.style.display = 'block';
+    }
+
+    inp.addEventListener('input', () => {
+      const q = inp.value.trim().toLowerCase();
+      if (!q) { dd.style.display = 'none'; return; }
+      const matches = _incomingFiles.filter(f => f.toLowerCase().includes(q));
+      showDropdown(matches);
+    });
+
+    inp.addEventListener('focus', () => {
+      const q = inp.value.trim().toLowerCase();
+      if (q && _incomingFiles.length) {
+        const matches = _incomingFiles.filter(f => f.toLowerCase().includes(q));
+        showDropdown(matches);
+      }
+    });
+
+    inp.addEventListener('blur', () => {
+      // Small delay so mousedown on a row fires first
+      setTimeout(() => { dd.style.display = 'none'; }, 150);
+    });
+
+    inp.addEventListener('keydown', e => {
+      if (e.key === 'Escape') { dd.style.display = 'none'; return; }
+      const rows = dd.querySelectorAll('div');
+      if (!rows.length) return;
+      const active = dd.querySelector('.dd-active');
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        const next = active ? (active.nextSibling || rows[0]) : rows[0];
+        if (active) { active.classList.remove('dd-active'); active.style.background = ''; }
+        next.classList.add('dd-active'); next.style.background = '#bae6fd';
+        next.scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        const prev = active ? (active.previousSibling || rows[rows.length-1]) : rows[rows.length-1];
+        if (active) { active.classList.remove('dd-active'); active.style.background = ''; }
+        prev.classList.add('dd-active'); prev.style.background = '#bae6fd';
+        prev.scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter' && active) {
+        e.preventDefault();
+        inp.value = active.textContent;
+        dd.style.display = 'none';
+        _setFileInputState(null);
+        autoFillFromFilename(active.textContent);
+      }
+    });
+  })();
+
+  // Shared function — called by both Preview btn (step 1) and Refresh btn (step 3)
+  async function runColumnPreview(statusEl) {
+    const fileInput = document.getElementById('sampleFileInput');
+    const filename  = fileInput && fileInput.value.trim();
+
+    if (!filename) {
+      _setFileInputState(false, 'Enter a filename first.');
+      statusEl.textContent = '';
+      statusEl.className = '';
+      return;
+    }
+    _setFileInputState(null);
+    statusEl.textContent = 'Checking…';
+    statusEl.className = '';
+
+    autoFillFromFilename(filename);
+
+    const fmtEl   = document.querySelector('[name=dev_file_format]');
+    const delimEl = document.querySelector('[name=dev_delimiter]');
+    const hdrEl   = document.querySelector('[name=dev_has_header]');
+    const skipEl  = document.querySelector('[name=dev_skip_rows]');
+    const nullEl  = document.querySelector('[name=dev_null_values]');
+
+    const fd = new FormData();
+    fd.append('server_filename', filename);
+    fd.append('file_format',  fmtEl   ? fmtEl.value   : 'csv');
+    fd.append('delimiter',    delimEl ? (delimEl.value || 'auto') : 'auto');
+    fd.append('has_header',   hdrEl   ? (hdrEl.checked ? 'true' : 'false') : 'true');
+    fd.append('skip_rows',    skipEl  ? skipEl.value   : '0');
+    fd.append('encoding',     'auto');
+    fd.append('null_values',  nullEl  ? nullEl.value   : 'NULL,null,None,NA');
+
+    try {
+      const resp = await fetch('/api/preview-columns', { method: 'POST', body: fd });
+      const data = await resp.json();
+      if (data.error) {
+        if (resp.status === 404) {
+          // File not found — red border on input, no text in status
+          _setFileInputState(false, '\u26a0 ' + data.error);
+          statusEl.textContent = '';
+          statusEl.className = '';
+        } else {
+          _setFileInputState(false, null);
+          statusEl.textContent = '\u26a0 ' + data.error;
+          statusEl.className = 'err';
+        }
+        return;
+      }
+      _setFileInputState(true);
+      renderColumnTable(data.columns);
+      syncDtypeHiddenFields();
+      statusEl.textContent = '\u2713 ' + data.columns.length + ' columns detected';
+      statusEl.className = 'ok';
+
+      // Show detected delimiter + back-fill field
+      if (data.detected_delimiter) {
+        const delimNames = { ',': 'comma (,)', ';': 'semicolon (;)', '|': 'pipe (|)', '\t': 'tab (\\t)' };
+        const badge = document.getElementById('detectedDelimBadge');
+        const delimLabel = delimNames[data.detected_delimiter] || data.detected_delimiter;
+        if (badge) { badge.textContent = '\u2714 Delimiter: ' + delimLabel; badge.style.display = 'inline-block'; }
+        if (delimEl && (!delimEl.value || delimEl.value === 'auto')) {
+          // Normalize real tab char (1-char '\t') to the '\t' string used in the delimiter select
+          delimEl.value = (data.detected_delimiter === '\t') ? '\\t' : data.detected_delimiter;
+        }
+      }
+    } catch(e) {
+      // 'Failed to fetch' = Flask container not reachable (network error)
+      // SyntaxError = Flask returned an HTML error page (500), not JSON
+      const hint = (e instanceof SyntaxError)
+        ? '\u26a0 Server returned an unexpected response — check web-ui container logs'
+        : (e.message === 'Failed to fetch')
+          ? '\u26a0 Cannot reach the server — check the web-ui container is running'
+          : '\u26a0 Request failed: ' + e.message;
+      statusEl.textContent = hint;
+      statusEl.className = 'err';
+    }
+  }
+
+  if (runPreviewBtn) {
+    runPreviewBtn.addEventListener('click', () => runColumnPreview(document.getElementById('previewStatus')));
+    const fileInput = document.getElementById('sampleFileInput');
+    if (fileInput) {
+      // Only auto-fill when the value looks like a complete filename (has an extension)
+      fileInput.addEventListener('input', () => {
+        _setFileInputState(null); // reset border as user types
+        const filename = fileInput.value.trim();
+        if (filename && /\.[a-z0-9]+$/i.test(filename)) autoFillFromFilename(filename);
+      });
+      fileInput.addEventListener('blur', () => {
+        const filename = fileInput.value.trim();
+        if (filename) autoFillFromFilename(filename);
+      });
+    }
+  }
+
+  const refreshColumnsBtn = document.getElementById('refreshColumnsBtn');
+  if (refreshColumnsBtn) {
+    refreshColumnsBtn.addEventListener('click', () => runColumnPreview(document.getElementById('colTabStatus')));
+  }
+
+  // Pre-load existing dtype overrides when editing a saved config
+  const existingDd = {{ data_dictionary_json | safe }};
+  (function preloadExistingOverrides() {
+    let existing = {};
+    try { existing = JSON.parse(document.getElementById('devDtypeOverridesJson').value || '{}'); } catch(e) {}
+    const dcEl = document.getElementById('devDateColumns');
+    const dateCols = (dcEl ? dcEl.value : '').split(',').map(s => s.trim()).filter(Boolean);
+    const cnEl = document.getElementById('devColumnNames');
+    const colNames = (cnEl ? cnEl.value : '').split(',').map(s => s.trim()).filter(Boolean);
+    const ddKeys = Object.keys(existingDd);
+    if (!Object.keys(existing).length && !dateCols.length && !ddKeys.length && !colNames.length) return;
+    const colMap = {};
+    // Seed from ordered column_names list (all columns, default text)
+    colNames.forEach(c => { colMap[c] = 'text'; });
+    // Seed from data dictionary (has descriptions + types)
+    ddKeys.forEach(c => {
+      const info = existingDd[c];
+      colMap[c] = (info && typeof info === 'object' && info.dtype) ? info.dtype : 'text';
+    });
+    dateCols.forEach(c => { colMap[c] = 'timestamp'; });
+    // dtype_overrides is highest priority — overrides everything above
+    Object.entries(existing).forEach(([c, dtype]) => { colMap[c] = dtype; });
+    const cols = Object.entries(colMap).map(([clean, dtype]) => ({ original: clean, clean, dtype, sample: [] }));
+    renderColumnTable(cols);
+  })();
+
+  // date_columns are now auto-derived from Column Types step (columns typed as date/timestamp)
+
+  // ── Schedule picker ──────────────────────────────────────────────────────────
+  // Schedule picker → sync to cron input
+  const picker  = document.getElementById('schedulePicker');
+  const schedInp = document.getElementById('scheduleInterval');
+  if (picker && schedInp) {
+    Array.from(picker.options).forEach(o => { if (o.value === schedInp.value) picker.value = o.value; });
+    picker.addEventListener('change', () => { if (picker.value) schedInp.value = picker.value; });
+  }
+
+  // Spark toggle → show/hide Spark config panel
+  const sparkToggle = document.getElementById('useSpark');
+  const sparkPanel  = document.getElementById('sparkConfigPanel');
+  function syncSparkPanel() {
+    if (!sparkPanel) return;
+    sparkPanel.style.display = sparkToggle && sparkToggle.checked ? 'block' : 'none';
+  }
+  if (sparkToggle) {
+    sparkToggle.addEventListener('change', () => { syncSparkPanel(); applyDagPrefix(); });
+    syncSparkPanel();
+  }
+
+  // File-format → show/hide CSV-specific fields
+  function syncCsvFields(selectEl, cssClass) {
+    if (!selectEl) return;
+    const isCsv = selectEl.value === 'csv';
+    document.querySelectorAll('.' + cssClass).forEach(el => {
+      el.style.display = isCsv ? '' : 'none';
+    });
+  }
+
+  const devFmtSel  = document.getElementById('devFileFormat');
+  const prodFmtSel = document.getElementById('prodFileFormat');
+
+  if (devFmtSel) {
+    devFmtSel.addEventListener('change', () => { syncCsvFields(devFmtSel, 'dev-csv-field'); applyDagPrefix(); });
+    syncCsvFields(devFmtSel, 'dev-csv-field');
+  }
+  if (prodFmtSel) {
+    prodFmtSel.addEventListener('change', () => syncCsvFields(prodFmtSel, 'prod-csv-field'));
+    syncCsvFields(prodFmtSel, 'prod-csv-field');
+  }
+
+  renderStep();
+
+  // ── Data Dictionary ──────────────────────────────────────────────────
+  const ddBody   = document.getElementById('ddBody');
+  const DD_TYPES = ['', 'text', 'integer', 'decimal', 'timestamp', 'boolean', 'date', 'json'];
+
+  function escAttr(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  }
+
+  function makeDdRow(col, dtype, desc) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input name="dd_col[]" value="${escAttr(col)}" placeholder="column_name"
+           style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+      <td><select name="dd_dtype[]" style="width:100%;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid #d1d5db;">
+        ${DD_TYPES.map(t => `<option value="${t}"${dtype===t?' selected':''}>${t||'—'}</option>`).join('')}
+      </select></td>
+      <td><input name="dd_desc[]" value="${escAttr(desc)}" placeholder="Brief description…"
+           style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+      <td><button type="button" title="Remove" onclick="this.closest('tr').remove()"
+           style="background:none;border:none;cursor:pointer;color:#dc2626;font-size:17px;line-height:1;">&#215;</button></td>
+    `;
+    return tr;
+  }
+
+  // Pre-populate from saved config (edit mode)
+  Object.entries(existingDd).forEach(([col, info]) => {
+    const desc  = typeof info === 'string' ? info : (info.description || '');
+    const dtype = (info && typeof info === 'object') ? (info.dtype || '') : '';
+    ddBody.appendChild(makeDdRow(col, dtype, desc));
+  });
+
+  document.getElementById('addDdRow').addEventListener('click', () => {
+    ddBody.appendChild(makeDdRow('', '', ''));
+    ddBody.lastElementChild.querySelector('input').focus();
+  });
+
+  // ── Load from detected columns (column preview table) ─────────────────
+  document.getElementById('fromColumnsBtn').addEventListener('click', () => {
+    const rows = document.querySelectorAll('#colPreviewBody tr');
+    if (!rows.length) {
+      alert('Run the column preview first (Step 1 or Step 3), then click this button.');
+      return;
+    }
+    // Gather already-entered column names so we don't duplicate
+    const existing = new Set(
+      Array.from(document.querySelectorAll('[name="dd_col[]"]')).map(i => i.value.trim()).filter(Boolean)
+    );
+    let added = 0;
+    rows.forEach(row => {
+      const cells = row.querySelectorAll('td');
+      if (!cells.length) return;
+      const cleanName  = cells[2] ? cells[2].textContent.trim() : '';
+      const suggestedType = cells[3] ? cells[3].textContent.trim() : '';
+      const overrideEl = cells[4] ? cells[4].querySelector('select') : null;
+      const dtype = (overrideEl && overrideEl.value) ? overrideEl.value : (suggestedType || '');
+      if (cleanName && !existing.has(cleanName)) {
+        ddBody.appendChild(makeDdRow(cleanName, dtype, ''));
+        existing.add(cleanName);
+        added++;
+      }
+    });
+    document.getElementById('aiStatus').style.color = '#0369a1';
+    document.getElementById('aiStatus').textContent = added
+      ? `✓ Added ${added} column(s) from file preview.`
+      : '✓ All detected columns already in dictionary.';
+  });
+
+  // ── AI suggest table description ─────────────────────────────────────
+  document.getElementById('suggestTableDescBtn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('tableDescStatus');
+    const dagId = (document.getElementById('dagIdInput') || {}).value || '';
+    const cols = Array.from(document.querySelectorAll('[name="dd_col[]"]'))
+                      .map(i => i.value.trim()).filter(Boolean);
+    statusEl.style.color = '#6b7a90';
+    statusEl.textContent = '⏳ Asking AI…';
+    try {
+      const resp = await fetch('/api/suggest-descriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({columns: cols, table: dagId, describe_table: true}),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        statusEl.style.color = '#b91c1c';
+        statusEl.textContent = '✗ ' + data.error;
+        return;
+      }
+      if (data.table_description) {
+        document.getElementById('tableDescInput').value = data.table_description;
+        statusEl.style.color = '#15803d';
+        statusEl.textContent = '✓ Table description filled';
+      } else {
+        statusEl.style.color = '#b45309';
+        statusEl.textContent = '⚠ AI returned no description';
+      }
+    } catch (e) {
+      statusEl.style.color = '#b91c1c';
+      statusEl.textContent = '✗ ' + e.message;
+    }
+  });
+
+  // ── AI suggest descriptions ───────────────────────────────────────────
+  // ── AI Suggest Types (Step 3 — Column Types) ─────────────────────────
+  document.getElementById('aiTypesBtn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('aiTypesStatus');
+    if (!_detectedCleanCols.length) {
+      statusEl.style.color = '#b45309';
+      statusEl.textContent = '⚠ Run "Re-detect Columns" first to preview the file.';
+      return;
+    }
+    const dagId = (document.getElementById('dagIdInput') || {}).value || '';
+    statusEl.style.color = '#6b7a90';
+    statusEl.textContent = '⏳ Asking AI…';
+    try {
+      const resp = await fetch('/api/suggest-descriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({columns: _detectedCleanCols, table: dagId}),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        statusEl.style.color = '#b91c1c';
+        statusEl.textContent = '✗ ' + data.error;
+        return;
+      }
+      let updated = 0;
+      Object.entries(data.suggestions || {}).forEach(([col, sug]) => {
+        const dtype = typeof sug === 'object' ? (sug.dtype || '') : '';
+        if (!dtype) return;
+        const sel = document.querySelector(`[data-col-clean="${CSS.escape(col)}"]`);
+        if (sel && Array.from(sel.options).some(o => o.value === dtype)) {
+          sel.value = dtype;
+          updated++;
+        }
+      });
+      syncDtypeHiddenFields();
+      statusEl.style.color = '#15803d';
+      statusEl.textContent = `✓ ${updated} type(s) updated by AI`;
+    } catch (e) {
+      statusEl.style.color = '#b91c1c';
+      statusEl.textContent = '✗ ' + e.message;
+    }
+  });
+
+  document.getElementById('suggestAiBtn').addEventListener('click', async () => {
+    const colInputs = Array.from(document.querySelectorAll('[name="dd_col[]"]'));
+    const cols = colInputs.map(i => i.value.trim()).filter(Boolean);
+    const statusEl = document.getElementById('aiStatus');
+    if (!cols.length) {
+      statusEl.style.color = '#b45309';
+      statusEl.textContent = '⚠ Add column names first (or load from detected columns), then click Suggest.';
+      return;
+    }
+    const dagId = (document.getElementById('dagIdInput') || {}).value || '';
+    statusEl.style.color = '#6b7a90';
+    statusEl.textContent = '⏳ Asking AI…';
+    try {
+      const resp = await fetch('/api/suggest-descriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({columns: cols, table: dagId}),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        statusEl.style.color = '#b91c1c';
+        statusEl.textContent = '✗ ' + data.error;
+        return;
+      }
+      colInputs.forEach(inp => {
+        const col = inp.value.trim();
+        const suggestion = data.suggestions[col];
+        if (suggestion) {
+          const row = inp.closest('tr');
+          const desc  = typeof suggestion === 'string' ? suggestion : (suggestion.description || '');
+          const dtype = typeof suggestion === 'object' ? (suggestion.dtype || '') : '';
+          row.querySelector('[name="dd_desc[]"]').value = desc;
+          if (dtype) row.querySelector('[name="dd_dtype[]"]').value = dtype;
+        }
+      });
+      statusEl.style.color = '#15803d';
+      statusEl.textContent = '✓ Descriptions & types updated';
+    } catch (e) {
+      statusEl.style.color = '#b91c1c';
+      statusEl.textContent = '✗ ' + e.message;
+    }
+  });
+
+  // ── Pre-submit validation + dtype sync ────────────────────────────────
+  const REQUIRED_FIELDS = [
+    { name: 'dag_id',           label: 'DAG ID',           step: 0 },
+    { name: 'dev_target_schema',label: 'Target Schema',    step: 3 },
+    { name: 'dev_target_table', label: 'Target Table',     step: 3 },
+  ];
+
+  function showError(msg) {
+    const banner = document.getElementById('saveErrorBanner');
+    banner.textContent = '\u26a0 ' + msg;
+    banner.style.display = 'block';
+    banner.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+
+  document.getElementById('jobForm').addEventListener('submit', function(e) {
+    syncDtypeHiddenFields();
+    const banner = document.getElementById('saveErrorBanner');
+    banner.style.display = 'none';
+
+    // Check each required field — jump to its step if empty
+    for (const req of REQUIRED_FIELDS) {
+      // querySelector picks the LAST element with that name (visible input, not hidden)
+      const els = document.querySelectorAll('[name="' + req.name + '"]');
+      const el  = els[els.length - 1]; // last = visible input (hidden fields come first)
+      if (!el || !el.value.trim()) {
+        e.preventDefault();
+        current = req.step;
+        renderStep();
+        showError('\"' + req.label + '\" is required. Please fill it in before saving.');
+        if (el) { el.focus(); el.style.borderColor = '#ef4444'; }
+        return;
+      }
+      if (el) el.style.borderColor = '';
+    }
+  });
+</script>
+</main>
+</body>
+</html>

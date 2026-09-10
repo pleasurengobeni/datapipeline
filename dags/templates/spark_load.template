@@ -1,0 +1,900 @@
+import json
+import logging
+import os
+import re
+from pathlib import Path
+import sys
+from datetime import datetime, timedelta
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+modules_path = Variable.get(
+    "modules_path", default_var=os.path.join(os.getcwd(), "dags", "modules")
+)
+if modules_path not in sys.path:
+    sys.path.insert(1, modules_path)
+
+from modules.import_modules import parse_sql_file
+from modules.utils import get_hook, read_json_file
+from modules import naming
+
+
+dag_name = "<dag_name>"
+
+# Every pipeline meta column any pipeline_type might write. A table can be
+# written to by any of them over its lifetime, so this list is used both to
+# strip stray meta columns from source data before hashing and to self-heal
+# the target table's schema before insert.
+_ALL_META_COLS = [
+    "_pipeline_inserted_at",
+    "_pipeline_run_id",
+    "_source_file",
+    "_file_checksum",
+    "_source_system",
+    "_loaded_at",
+    "_row_checksum",
+]
+
+
+def clean_string(input_string):
+    return re.sub(r"[^a-zA-Z0-9_]", "_", input_string).lower()
+
+
+def load_config(dag_name):
+    config_path = Variable.get(
+        "config_path", default_var=os.path.join(os.getcwd(), "dags", "config")
+    )
+    
+    config_file = naming.find_config_path(dag_name, Path(config_path))
+    if not config_file or not config_file.exists():
+        raise FileNotFoundError(
+            f"Config file for '{dag_name}' not found under '{config_path}'"
+        )
+    config = read_json_file(str(config_file))
+    env = Variable.get("environment", "dev")
+    if "source" in config and env in config.get("source", {}):
+        source_cfg = config["source"][env]
+        target_cfg = config["target"][env]
+    else:
+        source_cfg = config["source"]
+        target_cfg = config["target"]
+
+    source_schema = source_cfg.get("source_table_schema") or source_cfg.get("source_schema")
+    source_table  = source_cfg.get("source_table_name")  or source_cfg.get("source_table")
+    target_schema = target_cfg.get("target_table_schema") or target_cfg.get("target_schema")
+    target_table  = target_cfg.get("target_table_name")  or target_cfg.get("target_table")
+
+    # Spark-specific config block (safe defaults if missing)
+    spark_cfg = config.get("spark", {})
+
+    target_db = target_cfg.get("target_db") or target_cfg.get("target_schema")
+
+    return {
+        "dag_id": config.get("dag_id", f"ETL_{dag_name}"),
+        "schedule_interval": config.get("schedule_interval"),
+        "start_date": config.get("start_date", "2023-01-01"),
+        "source": {
+            "source_db_conn_id":           source_cfg.get("source_db_conn_id"),
+            "db_type":                     source_cfg.get("db_type"),
+            "source_table_schema":         source_schema,
+            "source_table_name":           source_table,
+            "incremental_column":          source_cfg.get("incremental_column") or source_cfg.get("hwm_column", ""),
+            "incremental_column_datatype": source_cfg.get("incremental_column_datatype") or source_cfg.get("hwm_datatype", "timestamp"),
+            "limit":                       source_cfg.get("limit"),
+            "full_load":                   source_cfg.get("full_load", False),
+            "batch_size":                  source_cfg.get("batch_size") if source_cfg.get("batch_size") is not None else config.get("batch_size", 0),
+            "sql_file":                    source_cfg.get("sql_file") or config.get("sql_file"),
+        },
+        "target": {
+            "target_db_conn_id":   target_cfg.get("target_db_conn_id"),
+            "target_db":           target_db,
+            "target_table_schema": target_schema,
+            "target_table_name":   target_table,
+            "incremental_column":  target_cfg.get("incremental_column"),
+            "db_type":             target_cfg.get("db_type", "postgresql"),
+        },
+        "spark": {
+            "master":          spark_cfg.get("master", "local[*]"),
+            "app_name":        spark_cfg.get("app_name", dag_name),
+            "executor_memory": spark_cfg.get("executor_memory", "2g"),
+            "executor_cores":  spark_cfg.get("executor_cores", 2),
+            "num_executors":   spark_cfg.get("num_executors", 2),
+            "driver_memory":   spark_cfg.get("driver_memory", "1g"),
+            "extra_conf":      spark_cfg.get("extra_conf", {}),
+        },
+        "read_chunk_size":   config.get("read_chunk_size", 500000),
+        "transformations":   config.get("transformations", []),
+        "rename_columns":    config.get("rename_columns", []),
+        "write_mode":        config.get("write_mode", "append"),
+        "tags":              config.get("tags", ["ETL", "SPARK", "spark-etl"]),
+        "sql_file":          source_cfg.get("sql_file") or config.get("sql_file"),
+    }
+
+
+CONFIG = load_config(dag_name)
+SQL_BASE = Variable.get("sql_path", default_var=os.path.join(os.getcwd(), "dags", "sql"))
+
+
+def _resolve_sql_path(sql_base, dag_name, sql_file=None):
+    import glob
+    if sql_file and os.path.isabs(sql_file):
+        return sql_file
+    if sql_file:
+        return os.path.join(sql_base, sql_file)
+    matches = glob.glob(os.path.join(sql_base, "**", f"*{dag_name.lower()}*.sql"), recursive=True)
+    if matches:
+        return matches[0]
+    return os.path.join(sql_base, f"{dag_name.lower()}.sql")
+
+
+SQL_PATH = _resolve_sql_path(SQL_BASE, dag_name, CONFIG.get("sql_file"))
+
+
+# ── Spark session factory ────────────────────────────────────────────────────
+
+def _get_spark():
+    """
+    Build (or reuse) a SparkSession configured from CONFIG["spark"].
+    JDBC driver jars are pre-installed in /opt/airflow/jars/ by the Dockerfile
+    and loaded via spark.jars so no Maven download is needed at runtime.
+    """
+    from pyspark.sql import SparkSession
+    import glob
+
+    # Collect all jars from the standard jar directory
+    jar_dir  = "/opt/airflow/jars"
+    jar_glob = glob.glob(f"{jar_dir}/*.jar")
+    jars_str = ",".join(jar_glob)  # comma-separated list Spark expects
+
+    scfg = CONFIG["spark"]
+    builder = (
+        SparkSession.builder
+        .appName(scfg["app_name"])
+        .master(scfg["master"])
+        .config("spark.executor.memory",  scfg["executor_memory"])
+        .config("spark.executor.cores",   str(scfg["executor_cores"]))
+        .config("spark.driver.memory",    scfg["driver_memory"])
+    )
+    if jars_str:
+        builder = builder.config("spark.jars", jars_str)
+    if scfg.get("num_executors"):
+        builder = builder.config("spark.executor.instances", str(scfg["num_executors"]))
+    for k, v in (scfg.get("extra_conf") or {}).items():
+        builder = builder.config(k, v)
+
+    return builder.getOrCreate()
+
+
+# ── JDBC helpers ─────────────────────────────────────────────────────────────
+
+def _jdbc_url_and_props(conn_id: str):
+    """
+    Derive a JDBC URL + properties dict from an Airflow connection.
+    Supports postgresql, mysql, mssql.
+    """
+    hook = get_hook(conn_id)
+    uri  = hook.get_uri()                          # e.g. postgresql://user:pass@host:5432/db
+    # Normalise scheme
+    uri  = re.sub(r"^\w+\+\w+://", lambda m: m.group(0).split("+")[0] + "://", uri)
+    from urllib.parse import urlparse
+    p    = urlparse(uri)
+    db_type = p.scheme.split("+")[0].lower()
+    host = p.hostname
+    port = p.port
+    db   = p.path.lstrip("/")
+    user = p.username
+    pwd  = p.password
+
+    if db_type in ("postgresql", "postgres"):
+        jdbc_url = f"jdbc:postgresql://{host}:{port or 5432}/{db}"
+        driver   = "org.postgresql.Driver"
+    elif db_type == "mysql":
+        jdbc_url = f"jdbc:mysql://{host}:{port or 3306}/{db}"
+        driver   = "com.mysql.cj.jdbc.Driver"
+    elif db_type in ("mssql", "sqlserver"):
+        jdbc_url = f"jdbc:sqlserver://{host}:{port or 1433};databaseName={db}"
+        driver   = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    else:
+        raise ValueError(f"Unsupported db_type for Spark JDBC: {db_type}")
+
+    props = {"user": user, "password": pwd, "driver": driver}
+    return jdbc_url, props
+
+
+# ── HWM helpers ──────────────────────────────────────────────────────────────
+
+# Sub-second format tokens — see data_load.template for full explanation.
+_SUBSECOND_FMT_TOKENS = frozenset({"MS", "US", "FF1", "FF2", "FF3", "FF4", "FF5", "FF6"})
+
+
+def _fmt_has_subsecond(fmt: str) -> bool:
+    upr = (fmt or "").upper()
+    return any(tok in upr for tok in _SUBSECOND_FMT_TOKENS)
+
+
+def _align_hwm_to_format(last_loaded, fmt: str):
+    """Truncate last_loaded to the precision the format can produce."""
+    if last_loaded is None:
+        return None
+    if _fmt_has_subsecond(fmt):
+        return last_loaded
+    if hasattr(last_loaded, "replace"):
+        try:
+            return last_loaded.replace(microsecond=0)
+        except TypeError:
+            pass
+    return last_loaded
+
+
+def _hwm_expressions(incremental_column, incremental_column_datatype, last_loaded):
+    """Return (order_expr, where_clause). where_clause=None when last_loaded is None."""
+    datatype   = (incremental_column_datatype or "").lower()
+    is_numeric = datatype in ("int", "bigint")
+    if is_numeric:
+        order_expr   = f"CAST({incremental_column} AS BIGINT)"
+        where_clause = f"{order_expr} > {int(last_loaded)}" if last_loaded is not None else None
+    else:
+        order_expr = f"CAST({incremental_column} AS TIMESTAMP)"
+        if last_loaded is not None:
+            # Spark TIMESTAMP has microsecond precision; truncate to seconds
+            # so the boundary comparison stays consistent when the target
+            # returns a sub-second HWM.
+            safe_hwm     = _align_hwm_to_format(last_loaded, "")  # no sub-second → truncate
+            where_clause = f"{order_expr} > '{safe_hwm}'"
+        else:
+            where_clause = None
+    return order_expr, where_clause
+
+
+def get_last_loaded_value():
+    """Return current HWM from the target table, or None for full-load / first run."""
+    if CONFIG["source"].get("full_load", False):
+        logging.info("get_last_loaded_value: full_load=True — skipping HWM query.")
+        return None
+
+    incremental_column = CONFIG["source"]["incremental_column"]
+    if not incremental_column:
+        return None
+
+    target_hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+    schema = CONFIG["target"]["target_table_schema"]
+    table  = CONFIG["target"]["target_table_name"]
+    query  = f"SELECT MAX({incremental_column}) AS max_val FROM {schema}.{table}"
+    try:
+        result = target_hook.get_first(query)
+        value  = result[0] if result else None
+        if value is None:
+            logging.info("Target table %s.%s is empty — first incremental run.", schema, table)
+        return value
+    except Exception as e:
+        logging.warning("Could not query target HWM (%s) — treating as first run.", e)
+        return None
+
+
+# ── Core tasks ───────────────────────────────────────────────────────────────
+
+def ensure_schema_exists(schema_name):
+    hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine_uri = hook.get_uri()
+    from sqlalchemy import create_engine, text
+    engine = create_engine(engine_uri)
+    with engine.begin() as conn:
+        conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {schema_name}"))
+
+
+def _ensure_pipeline_metadata_columns(schema: str, table: str):
+    """ALTER TABLE to add pipeline metadata columns if they don't exist yet.
+    Safe to call every run — IF NOT EXISTS is idempotent."""
+    from sqlalchemy import create_engine, text
+    hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine = create_engine(hook.get_uri())
+    cols = [
+        ("_row_checksum",         "TEXT"),
+        ("_pipeline_inserted_at", "TIMESTAMP"),
+        ("_pipeline_run_id",      "TEXT"),
+        ("_source_system",        "TEXT"),
+        ("_source_file",          "TEXT"),
+        ("_file_checksum",        "TEXT"),
+        ("_loaded_at",            "TIMESTAMP"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type in cols:
+            conn.execute(text(
+                f"ALTER TABLE {schema}.{table} "
+                f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+            ))
+
+
+def _target_table_exists(schema: str, table: str) -> bool:
+    """Return True if the target table already exists."""
+    try:
+        hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+        result = hook.get_first(
+            f"SELECT 1 FROM information_schema.tables "
+            f"WHERE table_schema = '{schema}' AND table_name = '{table}' LIMIT 1"
+        )
+        return result is not None
+    except Exception:
+        return False
+
+
+def create_target(**kwargs):
+    """
+    Ensure the target schema AND table both exist before extract runs.
+
+    Strategy:
+      1. CREATE SCHEMA IF NOT EXISTS  (via SQLAlchemy — no Spark needed)
+      2. If the table already exists  → nothing more to do
+      3. If the table is absent       → read zero rows from the source via
+         Spark JDBC (LIMIT 0 pushdown), then write that empty DataFrame with
+         mode='overwrite' to the target.  Spark derives the column types from
+         the source JDBC metadata and creates the table automatically.
+
+    This guarantees load_data never hits a "relation does not exist" error,
+    and the table schema always mirrors the source column types exactly.
+    """
+    schema = CONFIG["target"]["target_table_schema"]
+    table  = CONFIG["target"]["target_table_name"]
+
+    # Step 1 — schema
+    ensure_schema_exists(schema)
+
+    # Step 2 — table already there: add any missing metadata columns then return
+    if _target_table_exists(schema, table):
+        logging.info("create_target: %s.%s already exists — ensuring metadata columns.", schema, table)
+        _ensure_pipeline_metadata_columns(schema, table)
+        return
+
+    # Step 3 — derive table DDL from source by reading zero rows
+    logging.info("create_target: %s.%s not found — creating from source schema.", schema, table)
+    spark = _get_spark()
+
+    src_jdbc_url, src_props = _jdbc_url_and_props(CONFIG["source"]["source_db_conn_id"])
+    base_sql     = parse_sql_file(SQL_PATH) if SQL_PATH and os.path.exists(SQL_PATH) else None
+    source_schema = CONFIG["source"]["source_table_schema"]
+    source_table  = CONFIG["source"]["source_table_name"]
+
+    if base_sql:
+        dbtable = f"({base_sql}) _spark_schema_probe"
+    elif source_schema and source_table:
+        dbtable = f"{source_schema}.{source_table}"
+    else:
+        raise ValueError("create_target: no sql_file or source_table configured — cannot derive target schema.")
+
+    # LIMIT 0 pushdown — reads metadata only, zero data transfer
+    zero_row_dbtable = f"(SELECT * FROM {dbtable} LIMIT 0) _zero"
+
+    empty_df = (
+        spark.read.format("jdbc")
+        .option("url",      src_jdbc_url)
+        .option("dbtable",  zero_row_dbtable)
+        .option("user",     src_props["user"])
+        .option("password", src_props["password"])
+        .option("driver",   src_props["driver"])
+        .load()
+    )
+
+    tgt_jdbc_url, tgt_props = _jdbc_url_and_props(CONFIG["target"]["target_db_conn_id"])
+
+    # Inject metadata columns into the empty schema so the JDBC overwrite
+    # issues a CREATE TABLE that already includes them — no ALTER TABLE needed.
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StringType, TimestampType
+    empty_df = (
+        empty_df
+        .withColumn("_pipeline_inserted_at", F.lit(None).cast(TimestampType()))
+        .withColumn("_pipeline_run_id",       F.lit(None).cast(StringType()))
+        .withColumn("_source_system",         F.lit(None).cast(StringType()))
+        .withColumn("_loaded_at",             F.lit(None).cast(TimestampType()))
+        .withColumn("_row_checksum",          F.lit(None).cast(StringType()))
+    )
+
+    (
+        empty_df.write
+        .format("jdbc")
+        .option("url",      tgt_jdbc_url)
+        .option("dbtable",  f"{schema}.{table}")
+        .option("user",     tgt_props["user"])
+        .option("password", tgt_props["password"])
+        .option("driver",   tgt_props["driver"])
+        .mode("overwrite")   # creates the table; zero rows so no data is written
+        .save()
+    )
+    logging.info("create_target: %s.%s created with metadata columns included.", schema, table)
+
+
+def extract_data(**kwargs):
+    """
+    Read source data using Spark JDBC into a staging Parquet file.
+    Uses a pushdown WHERE clause for incremental loads (avoids full table scan).
+    Uses Spark partitioned JDBC read (partitionColumn + numPartitions) when
+    an incremental_column is available for parallel extraction.
+    """
+    incr_col      = CONFIG["source"]["incremental_column"]
+    incr_datatype = CONFIG["source"]["incremental_column_datatype"]
+    batch_size    = CONFIG["source"].get("batch_size") or 0
+    last_loaded   = get_last_loaded_value()
+
+    spark = _get_spark()
+    src_jdbc_url, src_props = _jdbc_url_and_props(CONFIG["source"]["source_db_conn_id"])
+
+    # Build source query / table reference
+    base_sql = parse_sql_file(SQL_PATH) if SQL_PATH and os.path.exists(SQL_PATH) else None
+    source_schema = CONFIG["source"]["source_table_schema"]
+    source_table  = CONFIG["source"]["source_table_name"]
+
+    if base_sql:
+        dbtable = f"({base_sql}) _spark_src"
+    elif source_schema and source_table:
+        dbtable = f"{source_schema}.{source_table}"
+    else:
+        raise ValueError("No sql_file or source_table configured for Spark extract.")
+
+    # Apply incremental filter as SQL pushdown predicate
+    _, where_clause = _hwm_expressions(incr_col, incr_datatype, last_loaded)
+    if where_clause:
+        dbtable = f"(SELECT * FROM {dbtable} WHERE {where_clause}) _spark_incremental"
+
+    # Apply batch limit via subquery (Spark has no native LIMIT on JDBC reads)
+    if batch_size and batch_size > 0:
+        dbtable = f"(SELECT * FROM {dbtable} LIMIT {batch_size}) _spark_batch"
+
+    reader = spark.read.format("jdbc").options(**{
+        "url":        src_jdbc_url,
+        "dbtable":    dbtable,
+        "user":       src_props["user"],
+        "password":   src_props["password"],
+        "driver":     src_props["driver"],
+        "fetchsize":  str(CONFIG.get("read_chunk_size", 500000)),
+    })
+
+    # Parallel partition read when we have a numeric HWM column and it's the first field
+    if incr_col and (incr_datatype or "").lower() in ("int", "bigint") and not where_clause:
+        reader = reader.options(
+            partitionColumn=incr_col,
+            lowerBound="0",
+            upperBound="9999999999",
+            numPartitions=str(CONFIG["spark"].get("num_executors", 2) * CONFIG["spark"].get("executor_cores", 2)),
+        )
+
+    df = reader.load()
+    row_count = df.count()
+    logging.info("Spark extract: %d rows read from source.", row_count)
+
+    if row_count == 0:
+        return {"path": None, "row_count": 0, "has_rows": False}
+
+    data_dump = Variable.get("data_dump", default_var=os.path.join(os.getcwd(), "data_dumps"))
+    target_conn_id = clean_string(CONFIG["target"]["target_db_conn_id"])
+    staging_path = f"{data_dump}/parquet/{target_conn_id}/{dag_name}/{kwargs['run_id']}/raw.parquet"
+    os.makedirs(os.path.dirname(staging_path), exist_ok=True)
+
+    df.write.mode("overwrite").parquet(staging_path)
+    logging.info("Spark extract: staged %d rows → %s", row_count, staging_path)
+    return {"path": staging_path, "row_count": int(row_count), "has_rows": True}
+
+
+def branch_on_rows(**kwargs):
+    payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+    return "process_data" if payload.get("has_rows") else "no_new_rows"
+
+
+def process_data(**kwargs):
+    """Apply transformations to the staged Parquet and write a processed copy."""
+    payload = kwargs["ti"].xcom_pull(task_ids="extract_data") or {}
+    if not payload.get("path"):
+        return {"path": None}
+
+    spark = _get_spark()
+    df    = spark.read.parquet(payload["path"])
+
+    # ── Transformations (driven by config) ──────────────────────────────────
+    for transform in CONFIG.get("transformations", []):
+        col_name = transform.get("column")
+        action   = transform.get("action")
+        value    = transform.get("value")
+        if col_name and action == "fill_null" and col_name in df.columns:
+            from pyspark.sql.functions import lit
+            df = df.fillna({col_name: value})
+        elif col_name and action == "cast" and col_name in df.columns:
+            df = df.withColumn(col_name, df[col_name].cast(value))
+
+    for rename in CONFIG.get("rename_columns", []):
+        old = rename.get("from")
+        new = rename.get("to")
+        if old and new and old in df.columns:
+            df = df.withColumnRenamed(old, new)
+
+    data_dump      = Variable.get("data_dump", default_var=os.path.join(os.getcwd(), "data_dumps"))
+    target_conn_id = clean_string(CONFIG["target"]["target_db_conn_id"])
+    processed_path = f"{data_dump}/parquet/{target_conn_id}/{dag_name}/{kwargs['run_id']}/processed.parquet"
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+
+    df.write.mode("overwrite").parquet(processed_path)
+    logging.info("Spark process: wrote processed data → %s", processed_path)
+    return {"path": processed_path}
+
+
+def load_data(**kwargs):
+    """Write the processed Parquet to the target DB via Spark JDBC.
+
+    On the very first run (table does not exist yet) Spark JDBC mode 'overwrite'
+    is used — this auto-creates the table with the correct column types derived
+    from the Parquet schema.  Subsequent runs use the configured write_mode
+    (default 'append') so existing data is not dropped.
+    """
+    payload = kwargs["ti"].xcom_pull(task_ids="process_data") or {}
+    if not payload.get("path"):
+        logging.warning("load_data: no processed file — skipping.")
+        return
+
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import TimestampType
+
+    spark = _get_spark()
+    df    = spark.read.parquet(payload["path"])
+
+    tgt_jdbc_url, tgt_props = _jdbc_url_and_props(CONFIG["target"]["target_db_conn_id"])
+    schema = CONFIG["target"]["target_table_schema"]
+    table  = CONFIG["target"]["target_table_name"]
+
+    ensure_schema_exists(schema)
+
+    # ── Pipeline metadata columns ─────────────────────────────────────────
+    run_id  = kwargs.get("run_id") or (kwargs["dag_run"].run_id if kwargs.get("dag_run") else "")
+    now     = datetime.utcnow()
+    # Drop any meta columns the source may already carry (e.g. the source DB
+    # table is itself another pipeline's DW target) so the hash reflects
+    # data only, not volatile pipeline metadata.
+    df          = df.drop(*[c for c in _ALL_META_COLS if c in df.columns])
+    data_cols   = [c for c in df.columns]
+    row_concat  = F.concat_ws("|", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in data_cols])
+    df = df.withColumn("_row_checksum",         F.md5(row_concat))
+    df = df.withColumn("_pipeline_inserted_at",  F.lit(str(now)).cast(TimestampType()))
+    df = df.withColumn("_pipeline_run_id",        F.lit(run_id))
+    df = df.withColumn("_source_system",          F.lit(CONFIG["dag_id"]))
+    df = df.withColumn("_loaded_at",              F.lit(str(now)).cast(TimestampType()))
+
+    # First run: table does not exist — overwrite creates it from Parquet schema.
+    # Subsequent runs: use the configured write_mode (typically 'append').
+    table_exists = _target_table_exists(schema, table)
+    mode = CONFIG.get("write_mode", "append") if table_exists else "overwrite"
+    logging.info("load_data: table_exists=%s → jdbc mode=%s", table_exists, mode)
+
+    row_count = df.count()  # count before write to avoid a second Parquet scan
+
+    (
+        df.write
+        .format("jdbc")
+        .option("url",       tgt_jdbc_url)
+        .option("dbtable",   f"{schema}.{table}")
+        .option("user",      tgt_props["user"])
+        .option("password",  tgt_props["password"])
+        .option("driver",    tgt_props["driver"])
+        .option("batchsize", str(CONFIG["source"].get("batch_size") or 10000))
+        .mode(mode)
+        .save()
+    )
+    logging.info("Spark load: wrote %d rows → %s.%s (mode=%s)", row_count, schema, table, mode)
+
+    # Ensure metadata columns exist on pre-existing tables (ALTER TABLE is idempotent)
+    _ensure_pipeline_metadata_columns(schema, table)
+
+
+def cleanup(**kwargs):
+    """Remove staging Parquet files to free local/HDFS storage."""
+    import shutil
+    for task_id in ("extract_data", "process_data"):
+        payload = kwargs["ti"].xcom_pull(task_ids=task_id) or {}
+        path = payload.get("path")
+        if path and os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
+            logging.info("Cleanup: removed %s", path)
+
+
+def collect_metrics_fn(**kwargs):
+    """
+    Write one row to pipeline.etl_metrics after every DAG run.
+    Computes:
+      - run_id                : Airflow run_id for traceability
+      - run_start / run_end   : when the DAG run actually started and when metrics were collected
+      - run_duration_secs     : wall-clock seconds from DAG run start to now
+      - run_status            : 'success' | 'no_new_rows' | 'failed'
+      - error_msg             : populated if an upstream task failed
+      - rows_loaded_now       : from XCom (this run)
+      - batch_size            : configured batch_size from CONFIG
+      - target_total_records  : COUNT(*) on target table
+      - target_today_records  : rows loaded today (incremental_column date = today)
+      - target_max/first_upload_date : MAX/MIN of incremental_column in target
+      - source_total_records  : COUNT(*) on source table
+      - source_loaded_to_max_target : rows at source with incremental <= target max
+      - perc_loaded           : source_loaded_to_max_target / source_total * 100
+      - engine_type           : 'spark'
+    """
+    from airflow.utils import timezone
+    from sqlalchemy import create_engine, text
+
+    ti      = kwargs["ti"]
+    dag_run = kwargs["dag_run"]
+    env     = Variable.get("environment", "dev")
+
+    # --- run timing ---------------------------------------------------------
+    run_id            = dag_run.run_id
+    run_start         = dag_run.start_date
+    run_end           = timezone.utcnow()
+    run_duration_secs = (
+        int((run_end - run_start).total_seconds()) if run_start else None
+    )
+
+    # --- detect upstream failures -------------------------------------------
+    run_status = "success"
+    error_msg  = None
+    try:
+        load_ti   = dag_run.get_task_instance("load_data")
+        no_new_ti = dag_run.get_task_instance("no_new_rows")
+
+        if no_new_ti and no_new_ti.state == "success":
+            run_status = "no_new_rows"
+        elif load_ti and load_ti.state not in ("success", "skipped", None):
+            run_status = "failed"
+            error_msg  = f"load_data task state: {load_ti.state}"
+    except Exception:
+        pass
+
+    # --- row counts from this run -------------------------------------------
+    extract_payload = ti.xcom_pull(task_ids="extract_data") or {}
+    rows_loaded_now = extract_payload.get("row_count", 0) or 0
+    if run_status == "no_new_rows":
+        rows_loaded_now = 0
+
+    # --- config values ------------------------------------------------------
+    batch_size    = CONFIG["source"].get("batch_size") or None
+    target_schema = CONFIG["target"]["target_table_schema"]
+    target_table  = CONFIG["target"]["target_table_name"]
+    incr_col      = CONFIG["source"]["incremental_column"]
+    incr_datatype = (CONFIG["source"].get("incremental_column_datatype") or "").lower()
+    is_numeric    = incr_datatype in ("int", "bigint")
+
+    # --- target stats (via plain SQL — no Spark needed for counts) ----------
+    target_hook  = get_hook(CONFIG["target"]["target_db_conn_id"])
+
+    target_total = target_today = None
+    target_max_upload = target_first_upload = target_max_incr = None
+
+    try:
+        target_total = (target_hook.get_first(
+            f"SELECT COUNT(*) FROM {target_schema}.{target_table}"
+        ) or [0])[0]
+
+        if incr_col:
+            if is_numeric:
+                target_today_sql = (
+                    f"SELECT COUNT(*) FROM {target_schema}.{target_table} "
+                    f"WHERE CAST({incr_col} AS BIGINT) > 0"
+                )
+            else:
+                target_today_sql = (
+                    f"SELECT COUNT(*) FROM {target_schema}.{target_table} "
+                    f"WHERE DATE(CAST({incr_col} AS TIMESTAMP)) = CURRENT_DATE"
+                )
+            target_today = (target_hook.get_first(target_today_sql) or [0])[0]
+
+            target_max_incr_raw = (target_hook.get_first(
+                f"SELECT MAX({incr_col}) FROM {target_schema}.{target_table}"
+            ) or [None])[0]
+            target_max_incr = str(target_max_incr_raw) if target_max_incr_raw is not None else None
+
+            if not is_numeric:
+                target_max_upload = (target_hook.get_first(
+                    f"SELECT MAX(CAST({incr_col} AS TIMESTAMP)) FROM {target_schema}.{target_table}"
+                ) or [None])[0]
+                target_first_upload = (target_hook.get_first(
+                    f"SELECT MIN(CAST({incr_col} AS TIMESTAMP)) FROM {target_schema}.{target_table}"
+                ) or [None])[0]
+
+    except Exception as e:
+        logging.warning("collect_metrics: could not query target stats: %s", e)
+
+    # --- source stats + coverage calculation --------------------------------
+    source_total = source_loaded_to_max_target = source_max_incr = None
+
+    try:
+        source_hook       = get_hook(CONFIG["source"]["source_db_conn_id"])
+        source_schema     = CONFIG["source"]["source_table_schema"]
+        source_table_name = CONFIG["source"]["source_table_name"]
+
+        # Build the FROM clause: prefer explicit table name, fall back to SQL file as subquery
+        if source_schema and source_table_name:
+            from_clause = f"{source_schema}.{source_table_name}"
+        else:
+            _base_sql   = parse_sql_file(SQL_PATH)
+            from_clause = f"({_base_sql}) _src"
+
+        source_total = (source_hook.get_first(
+            f"SELECT COUNT(*) FROM {from_clause}"
+        ) or [None])[0]
+
+        if incr_col:
+            source_max_incr_raw = (source_hook.get_first(
+                f"SELECT MAX({incr_col}) FROM {from_clause}"
+            ) or [None])[0]
+            source_max_incr = str(source_max_incr_raw) if source_max_incr_raw is not None else None
+
+            # How many source rows are covered up to the target's current max?
+            if target_max_incr is not None:
+                if is_numeric:
+                    coverage_sql = (
+                        f"SELECT COUNT(*) FROM {from_clause} "
+                        f"WHERE CAST({incr_col} AS BIGINT) <= {target_max_incr}"
+                    )
+                else:
+                    coverage_sql = (
+                        f"SELECT COUNT(*) FROM {from_clause} "
+                        f"WHERE CAST({incr_col} AS TIMESTAMP) <= '{target_max_incr}'"
+                    )
+                source_loaded_to_max_target = (source_hook.get_first(coverage_sql) or [None])[0]
+
+    except Exception as e:
+        logging.warning("collect_metrics: could not query source stats: %s", e)
+
+    # --- perc_loaded: % of source rows covered in target --------------------
+    perc_loaded = None
+    if source_total and source_loaded_to_max_target is not None:
+        perc_loaded = round((source_loaded_to_max_target / source_total) * 100, 2)
+    elif source_total and target_total:
+        perc_loaded = round((target_total / source_total) * 100, 2)
+
+    # --- write to pipeline.etl_metrics -------------------------------------
+    metrics_conn_id = Variable.get("metrics_db_conn_id", default_var=CONFIG["target"]["target_db_conn_id"])
+    metrics_hook    = get_hook(metrics_conn_id)
+    metrics_engine  = create_engine(metrics_hook.get_uri())
+
+    # Auto-create schema + table on first use (idempotent)
+    with metrics_engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id                          SERIAL PRIMARY KEY,
+                dag_id                      TEXT,
+                env                         TEXT,
+                schema                      TEXT,
+                table_name                  TEXT,
+                run_id                      TEXT,
+                run_start                   TIMESTAMP WITH TIME ZONE,
+                run_end                     TIMESTAMP WITH TIME ZONE,
+                run_duration_secs           INTEGER,
+                run_status                  TEXT NOT NULL DEFAULT 'success',
+                error_msg                   TEXT,
+                batch_size                  INTEGER,
+                rows_loaded_now             BIGINT,
+                target_total_records        BIGINT,
+                target_today_records        BIGINT,
+                target_max_upload_date      TIMESTAMP,
+                target_first_upload_date    TIMESTAMP,
+                target_max_incremental      TEXT,
+                source_total_records        BIGINT,
+                source_max_incremental      TEXT,
+                source_loaded_to_max_target BIGINT,
+                perc_loaded                 NUMERIC(6,2),
+                engine_type                 TEXT DEFAULT 'spark',
+                created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        """))
+        # Schema migrations — add columns that may be missing from older table versions
+        migrations = [
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_today_records        BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_upload_date      TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_first_upload_date    TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_incremental      TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_total_records        BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_max_incremental      TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_loaded_to_max_target BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS perc_loaded                 NUMERIC(6,2)",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type                 TEXT DEFAULT 'pandas'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type                 TEXT DEFAULT 'db'",
+        ]
+        for migration in migrations:
+            conn.execute(text(migration))
+
+    with metrics_engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name,
+                run_id, run_start, run_end, run_duration_secs,
+                run_status, error_msg, batch_size,
+                rows_loaded_now,
+                target_total_records, target_today_records,
+                target_max_upload_date, target_first_upload_date,
+                target_max_incremental,
+                source_total_records, source_max_incremental,
+                source_loaded_to_max_target,
+                perc_loaded,
+                engine_type,
+                source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name,
+                :run_id, :run_start, :run_end, :run_duration_secs,
+                :run_status, :error_msg, :batch_size,
+                :rows_loaded_now,
+                :target_total, :target_today,
+                :target_max_upload, :target_first_upload,
+                :target_max_incr,
+                :source_total, :source_max_incr,
+                :source_loaded_to_max_target,
+                :perc_loaded,
+                'spark',
+                'db'
+            )
+        """), {
+            "dag_id":                      CONFIG["dag_id"],
+            "env":                         env,
+            "schema":                      CONFIG["source"].get("source_table_schema"),
+            "table_name":                  target_table,
+            "run_id":                      run_id,
+            "run_start":                   run_start,
+            "run_end":                     run_end,
+            "run_duration_secs":           run_duration_secs,
+            "run_status":                  run_status,
+            "error_msg":                   error_msg,
+            "batch_size":                  batch_size,
+            "rows_loaded_now":             rows_loaded_now,
+            "target_total":                target_total,
+            "target_today":                target_today,
+            "target_max_upload":           target_max_upload,
+            "target_first_upload":         target_first_upload,
+            "target_max_incr":             target_max_incr,
+            "source_total":                source_total,
+            "source_max_incr":             source_max_incr,
+            "source_loaded_to_max_target": source_loaded_to_max_target,
+            "perc_loaded":                 perc_loaded,
+        })
+    logging.info(
+        "collect_metrics[spark]: %s.%s | run_id=%s | duration=%ss | status=%s | "
+        "this_run=%s | target=%s | source=%s | covered=%s | perc=%.1f%%",
+        target_schema, target_table, run_id, run_duration_secs, run_status,
+        rows_loaded_now, target_total, source_total,
+        source_loaded_to_max_target, perc_loaded or 0,
+    )
+
+
+# ── DAG definition ────────────────────────────────────────────────────────────
+
+default_args = {
+    "owner":           "airflow",
+    "start_date":      datetime.strptime(CONFIG["start_date"], "%Y-%m-%d"),
+    "retries":         3,
+    "retry_delay":     timedelta(seconds=10),
+    "depends_on_past": False,
+}
+
+dag = DAG(
+    dag_id=CONFIG["dag_id"],
+    default_args=default_args,
+    schedule_interval=CONFIG["schedule_interval"],
+    tags=CONFIG["tags"],
+    catchup=False,
+    concurrency=4,
+    max_active_runs=1,
+)
+
+start               = EmptyOperator(task_id="start",         dag=dag)
+end                 = EmptyOperator(task_id="end",           dag=dag, trigger_rule=TriggerRule.NONE_FAILED)
+no_new_rows         = EmptyOperator(task_id="no_new_rows",   dag=dag)
+
+create_target_task  = PythonOperator(task_id="create_target",    python_callable=create_target,    provide_context=True, dag=dag)
+extract_task        = PythonOperator(task_id="extract_data",     python_callable=extract_data,     provide_context=True, dag=dag)
+branch_task         = BranchPythonOperator(task_id="branch_on_rows", python_callable=branch_on_rows, provide_context=True, dag=dag)
+process_task        = PythonOperator(task_id="process_data",     python_callable=process_data,     provide_context=True, dag=dag)
+load_task           = PythonOperator(task_id="load_data",        python_callable=load_data,        provide_context=True, dag=dag)
+cleanup_task        = PythonOperator(task_id="cleanup",          python_callable=cleanup,          provide_context=True,
+                                     trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS, dag=dag)
+collect_metrics_task = PythonOperator(task_id="collect_metrics", python_callable=collect_metrics_fn, provide_context=True,
+                                      trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS, dag=dag)
+
+start >> create_target_task >> extract_task >> branch_task
+branch_task >> no_new_rows >> collect_metrics_task >> end
+branch_task >> process_task >> load_task >> cleanup_task >> collect_metrics_task >> end

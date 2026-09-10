@@ -1,0 +1,59 @@
+# Security overlay — add Falco runtime threat detection.
+# Usage:
+#   make falco-up            → start Falco alongside the main stack
+#   make falco-down          → stop Falco
+#   docker compose -f docker-compose.yaml -f docker-compose.security.yaml up -d
+#
+# Falco needs privileged access to the host kernel to monitor syscalls.
+# It does NOT need access to container app data — it only reads kernel events.
+#
+# Driver: modern_ebpf (see engine.kind in falco/falco.yaml). This image
+# (0.44.0+) ships no driver-loader entrypoint at all — it's a "no-driver"
+# image built around modern_ebpf, which needs no kernel module and no
+# kernel-specific prebuilt binary. kmod was tried first and confirmed
+# broken on this kernel two different ways: 0.38.1's bundled kmod driver
+# source predates a kernel 6.8 class_create() API change (upstream bug,
+# fixed at their end by milestone 0.42.0 — falcosecurity/falco#3635), and
+# separately this image has no mechanism left to build/load a kmod driver
+# even once that upstream fix is in place (that's now a separate
+# falco-driver-loader image/step, not this one). modern_ebpf sidesteps
+# both — confirmed running successfully on this server's kernel
+# (6.8.0-111-generic) with this image version.
+#
+# NOTE: Falco cannot run on macOS Docker Desktop (no host kernel access).
+#       It is designed for Linux servers. The container will exit cleanly on mac
+#       without affecting the main stack.
+
+services:
+  falco:
+    image: falcosecurity/falco:0.44.0
+    container_name: falco
+    privileged: true
+    pid: host
+    network_mode: host
+    # privileged: true does not raise ulimits — modern_ebpf's ring buffers
+    # need locked memory and fail scap_init under Docker's default 64KB
+    # memlock limit.
+    ulimits:
+      memlock: -1
+    volumes:
+      - /dev:/host/dev
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /var/run/docker.sock:/host/var/run/docker.sock:ro
+      - /boot:/host/boot:ro
+      - /etc:/host/etc:ro
+      - ./falco/falco.yaml:/etc/falco/falco.yaml
+      - ./falco/custom_rules.yaml:/etc/falco/rules.d/custom_rules.yaml:ro
+      - ./logs/falco:/var/log/falco
+    environment:
+      - HOST_ROOT=/host
+      - FALCO_BPF_PROBE=
+    command: ["/usr/bin/falco", "-c", "/etc/falco/falco.yaml"]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+        tag: "falco"

@@ -1,0 +1,13 @@
+# Pinned below 1.53 — 1.53+ introduced experimental Starlette/ASGI support
+# that (as of 1.61.0, resolved against the latest starlette 1.4.0) crashes
+# every request with "GZipResponder.__init__() missing 1 required
+# keyword-only argument: 'thread_minimum_size'". 1.52.2 is the last release
+# on the stable, battle-tested Tornado server, avoiding that code path
+# entirely regardless of whatever starlette version pip resolves alongside.
+streamlit==1.52.2
+plotly
+pandas
+sqlalchemy
+psycopg2-binary
+python-dotenv
+cryptography

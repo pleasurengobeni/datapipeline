@@ -1,0 +1,7 @@
+Service	URL
+Airflow UI	http://98.80.129.35:8090
+ETL Manager	http://98.80.129.35:5001
+Pipeline Monitor	http://98.80.129.35:8050
+Analytics (Streamlit)	http://98.80.129.35:8501
+Jenkins CI/CD	http://98.80.129.35:9090
+PostgreSQL	98.80.129.35:55432

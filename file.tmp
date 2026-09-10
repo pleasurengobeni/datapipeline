@@ -1,0 +1,987 @@
+# plengo_analytics
+
+ETL pipeline platform and analytics dashboards for plengo data monitoring and decision-making.  
+Built on **Apache Airflow 2.6**, **PostgreSQL**, **Redis (Celery)**, and a lightweight **Flask Web UI**.
+
+---
+
+## Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Docker Compose                         │
+│                                                             │
+│  ┌──────────────┐   ┌─────────────────────────────────┐    │
+│  │  Web UI :5001│   │         Apache Airflow           │    │
+│  │  (Flask)     │   │  Webserver :8090 / Scheduler /   │    │
+│  │              │   │  Celery Worker / Triggerer        │    │
+│  └──────┬───────┘   └──────────────┬────────────────── ┘    │
+│         │                          │                         │
+│         └──────────┬───────────────┘                         │
+│                    │                                         │
+│          ┌─────────▼──────────┐    ┌─────────────┐          │
+│          │  PostgreSQL :55432 │    │  Redis :6379│          │
+│          │  (Airflow meta DB) │    │  (Celery    │          │
+│          └────────────────────┘    │   broker)   │          │
+│                                    └─────────────┘          │
+└─────────────────────────────────────────────────────────────┘
+
+Volumes (host ↔ containers):
+  ./dags        → /opt/airflow/dags   (DAGs, configs, SQL, modules)
+  ./logs        → /opt/airflow/logs   (gitignored)
+  ./plugins     → /opt/airflow/plugins
+  ./data_dumps  → /opt/airflow/data_dump
+```
+
+---
+
+## Quick Start
+
+### 1. Prerequisites
+- Docker & Docker Compose v2
+- 4 GB RAM, 2 CPUs, 10 GB disk (Airflow minimum)
+
+---
+
+## Server Setup (Ubuntu 24.04)
+
+### 1. Create project directory
+
+```bash
+cd ~/
+mkdir -p datapipeline/airflow
+cd datapipeline/airflow
+```
+
+### 2. SSH key for GitHub
+
+```bash
+ssh-keygen -t ed25519 -C "your@email.com"   # press Enter at all prompts
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+cat ~/.ssh/id_ed25519.pub                    # copy this output
+```
+
+Go to **GitHub → Settings → SSH and GPG keys → New SSH key**, paste the key, save.
+
+```bash
+ssh -T git@github.com   # test — expect: "Hi username! You've successfully authenticated..."
+```
+
+### 3. Clone the repo
+
+```bash
+# must be inside the airflow directory
+git clone git@github.com:pleasurengobeni/plengo-data-infra-v2.git .
+```
+
+### 4. Install Docker
+
+```bash
+# Remove old versions
+sudo apt-get remove -y docker docker-engine docker.io containerd runc || true
+sudo apt-get purge -y docker docker-engine docker.io containerd runc || true
+sudo rm -rf /var/lib/docker /var/lib/containerd || true
+
+# Install
+sudo apt-get update -y && sudo apt-get upgrade -y
+sudo apt-get install -y ca-certificates curl gnupg lsb-release
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Enable and add user to docker group
+sudo systemctl enable docker && sudo systemctl start docker
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Test
+docker run hello-world
+```
+
+### 5. Set environment variables
+
+```bash
+nano ~/.airflow   # create the secrets file
+```
+
+Paste the full variable block (see [Configure environment](#2-configure-environment) below), then:
+
+```bash
+echo 'source ~/.airflow' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 6. Fix permissions
+
+```bash
+sudo chown -R $(id -u):0 ~/datapipeline/airflow
+sudo chmod -R g+rwx ~/datapipeline/airflow
+git config core.fileMode false
+```
+
+### 7. Open firewall ports (if needed)
+
+```bash
+sudo iptables -A INPUT -p tcp --dport 8090 -j ACCEPT   # Airflow
+sudo iptables -A INPUT -p tcp --dport 5001 -j ACCEPT   # Web UI
+sudo iptables -A INPUT -p tcp --dport 8050 -j ACCEPT   # Pipeline Monitor
+sudo iptables -A INPUT -p tcp --dport 9090 -j ACCEPT   # Jenkins
+sudo iptables -A INPUT -p tcp --dport 5050 -j ACCEPT   # PgAdmin
+sudo iptables -A INPUT -p tcp --dport 5432 -j ACCEPT   # PostgreSQL
+```
+
+### 8. CI/CD — Jenkins (auto-deploy on git push)
+
+Jenkins is included in the Docker Compose stack and accessible at **http://\<server-ip\>:9090**.  
+The Jenkins image is built from `jenkins/Dockerfile` which pre-installs `rsync`.
+
+#### 8.1 First-time Jenkins setup
+
+```bash
+# Get the initial admin password
+docker exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+```
+
+Open **http://\<server-ip\>:9090**, paste the password → **Install suggested plugins** → create your admin user → **Start using Jenkins**.
+
+#### 8.2 Add GitHub host keys to Jenkins container
+
+Run this **once** so Jenkins can connect to GitHub over SSH without "Host key verification failed":
+
+```bash
+docker exec -u root jenkins bash -c "
+  mkdir -p /var/jenkins_home/.ssh &&
+  ssh-keyscan -t rsa,ecdsa,ed25519 github.com >> /var/jenkins_home/.ssh/known_hosts &&
+  chmod 600 /var/jenkins_home/.ssh/known_hosts &&
+  chown -R jenkins:jenkins /var/jenkins_home/.ssh
+"
+```
+
+#### 8.3 Generate a dedicated deploy SSH key
+
+```bash
+ssh-keygen -t ed25519 -C "jenkins-deploy@wasac" -f ~/.ssh/jenkins_deploy -N ""
+```
+
+Add an SSH config entry so git on the server uses this key for GitHub:
+
+```bash
+cat >> ~/.ssh/config << 'EOF'
+
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/jenkins_deploy
+    IdentitiesOnly yes
+EOF
+```
+
+Test the connection:
+```bash
+ssh -T git@github.com   # expect: Hi <username>! You've successfully authenticated...
+```
+
+#### 8.4 Add public key to GitHub repo Deploy Keys
+
+GitHub → **pleasurengobeni/datapipeline → Settings → Deploy keys → Add deploy key**
+- Title: `wasac-server-deploy`
+- Key: paste output of `cat ~/.ssh/jenkins_deploy.pub`
+- ✅ Allow write access → **Add key**
+
+> **Note:** Do NOT add this key to your personal GitHub account SSH keys — GitHub rejects keys already linked to another account. Use the repo-level Deploy Keys instead.
+
+#### 8.5 Add private key to Jenkins credentials
+
+Jenkins → **Manage Jenkins → Credentials → System → Global credentials → Add Credentials**
+- Kind: `SSH Username with private key`
+- ID: `github-deploy-key`
+- Username: `git`
+- Private key → `Enter directly` → paste output of `cat ~/.ssh/jenkins_deploy`
+- Save
+
+#### 8.6 Create the deploy job
+
+Jenkins → **New Item** → name: `wasac-deploy` → **Freestyle project** → OK
+
+**Source Code Management → Git:**
+- Repository URL: `git@github.com:pleasurengobeni/datapipeline.git`
+- Credentials: select `github-deploy-key`
+- Branch specifier: `*/main`  ← important: default is `*/master`, change to `*/main`
+
+**Build Triggers:**
+- ✅ **GitHub hook trigger for GITScm polling**
+
+**Build Steps → Add build step → Execute shell:**
+```bash
+chmod +x $WORKSPACE/deploy.sh
+DEPLOY_TARGET=/deployment $WORKSPACE/deploy.sh
+```
+
+Save → **Build Now** to test manually.
+
+> **How it works:** Jenkins checks out the latest code from GitHub into its workspace. `deploy.sh` then:
+> 1. Backs up Web UI generated files (`dags/config/`, `dags/sql/`, `dags/etl/`) from `/deployment`
+> 2. `rsync`s the fresh workspace into `/deployment` (the live repo, mounted via Docker volume)
+> 3. Restores the backed-up Web UI files — they always win over repo versions
+>
+> **Volume mapping:** In `docker-compose.yaml` the Jenkins service mounts `. :/deployment`.  
+> On the Linux server `. ` = `~/datapipeline/airflow`, so `/deployment` inside Jenkins = `~/datapipeline/airflow` on the host. ✅
+
+#### 8.7 Add GitHub webhook (auto-trigger on every push)
+
+GitHub → **pleasurengobeni/datapipeline → Settings → Webhooks → Add webhook**
+- Payload URL: `http://<server-ip>:9090/github-webhook/`
+- Content type: `application/json`
+- Trigger: **Just the push event**
+- Save
+
+Now every `git push` to `main` automatically triggers a safe deploy on the server.
+
+---
+
+## Quick Start
+
+### 2. Configure environment
+
+`.env` is committed to git as a **template** — all values are `${VAR}` placeholders. Real values are never stored in the repo.
+
+Create `~/.airflow` on each server with your actual values:
+
+```bash
+# ~/.airflow — create this manually on the server, never commit it
+POSTGRES_USER="airflow"
+POSTGRES_PASSWORD="airflow"
+POSTGRES_DATA_USER="admin"
+POSTGRES_DATA_PWD="your_password"
+POSTGRES_DATA_PORT=5432
+POSTGRES_DATA_HOST="your_db_host"
+POSTGRES_DATA_DB="your_db_name"
+PGADMIN_DEFAULT_EMAIL="you@example.com"
+PGADMIN_DEFAULT_PASSWORD="your_password"
+PGADMIN_PORT=5050
+AIRFLOW_UID=1000
+AIRFLOW_GID=1000
+DOCKER_AIRFLOW_HOME="/opt/airflow"
+AIRFLOW__CORE__FERNET_KEY="your_fernet_key"
+AIRFLOW__CORE__DEFAULT_TIMEZONE="UTC"
+AIRFLOW__CORE__DAGBAG_IMPORT_TIMEOUT=1000
+AIRFLOW__CORE__DAG_FILE_PROCESSOR_TIMEOUT=1000
+AIRFLOW__CORE__SQL_ALCHEMY_CONN="postgresql+psycopg2://airflow:airflow@postgres/airflow"
+AIRFLOW__CELERY__RESULT_BACKEND="db+postgresql://airflow:airflow@postgres/airflow"
+AIRFLOW__WEBSERVER__SECRET_KEY="your_secret_key"
+AIRFLOW__WEBSERVER__WEB_SERVER_MASTER_TIMEOUT=1000
+AIRFLOW__SCHEDULER__PARSING_PROCESSES=10
+SQLALCHEMY_SILENCE_UBER_WARNING=1
+_AIRFLOW_WWW_USER_USERNAME="admin"
+_AIRFLOW_WWW_USER_PASSWORD="your_password"
+AIRFLOW_CONN_AIRFLOW="postgresql+psycopg2://airflow:airflow@postgres/airflow"
+OPENMENTA_USER="openmeta"
+OPENMENTA_PASSWORD="your_password"
+AIRFLOW_VAR_ENVIRONMENT="dev"
+AIRFLOW_VAR_MODULES_PATH="/opt/airflow/dags/modules"
+AIRFLOW_VAR_CONFIG_PATH="/opt/airflow/dags/config"
+AIRFLOW_VAR_SQL_PATH="/opt/airflow/dags/sql"
+AIRFLOW_VAR_ETL_PATH="/opt/airflow/dags/etl"
+AIRFLOW_VAR_TEMPLATE_PATH="/opt/airflow/dags/templates"
+AIRFLOW_VAR_DATA_DUMP="/opt/airflow/data_dump"
+AIRFLOW_VAR_LOGS_PATH="/opt/airflow/logs"
+AIRFLOW_VAR_DAG_HOME="/opt/airflow/dags"
+AIRFLOW_VAR_SLACK_TOKEN="your_slack_token"
+AIRFLOW_VAR_DW_CONFIG_PATH="/opt/airflow/dags/dw_config"
+AIRFLOW_VAR_DW_TEMPLATE_PATH="/opt/airflow/dags/templates"
+AIRFLOW_VAR_DW_ETL_PATH="/opt/airflow/dags/dw_etl"
+AIRFLOW_VAR_DW_SQL_PATH="/opt/airflow/dags/dw_sql"
+AIRFLOW_VAR_DW_DEFAULT_SCHEMA="edw_core"
+AIRFLOW_VAR_DW_LOG_RETENTION_DAYS=30
+WEBUI_SECRET_KEY="your_webui_secret_key"
+WEBUI_ADMIN_USER="admin"
+WEBUI_ADMIN_PASS="your_password"
+```
+
+Then source it in `~/.bashrc`:
+
+```bash
+# ~/.bashrc
+source ~/.airflow
+```
+
+> **Note:** SQL connection strings use `@postgres/airflow` (Docker service name), not `localhost`.  
+> To generate keys:
+> ```bash
+> # Fernet key
+> python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+> # Secret keys
+> python -c "import secrets; print(secrets.token_hex(32))"
+> ```
+
+### 3. Start the stack
+
+Use `make` to manage the stack. It automatically sources `~/.airflow` before every docker compose command so all real env vars are loaded.
+
+```bash
+make          # start all services (default)
+make down     # stop and remove all containers
+make restart  # stop then start (clean restart)
+make logs     # tail logs for all services
+
+# Single service
+make restart-service s=web-ui
+make logs-service s=airflow-scheduler
+```
+
+**What `make` does on every run:**
+1. Sources `~/.airflow` → loads all real env vars into the shell
+2. Runs `docker compose --env-file .env <action>` — docker compose reads `.env` for substitution, using the values loaded from `~/.airflow`
+3. Prints all service URLs on startup
+
+> **If `~/.airflow` is missing**, you will see a warning and docker compose will start with blank env vars — services will fail. Create `~/.airflow` first (see Step 2 above).
+
+### Web services — all accessible via browser
+
+| Service | URL |
+|---|---|
+| Airflow Webserver | http://localhost:8090 |
+| Web UI (ETL Manager) | http://localhost:5001 |
+| Pipeline Monitor | http://localhost:8050 |
+| Jenkins | http://localhost:9090 |
+| PgAdmin | http://localhost:5050 |
+| PostgreSQL | localhost:55432 |
+
+---
+
+### Service Descriptions
+
+#### 🌀 Apache Airflow — http://localhost:8090
+The core orchestration engine. Airflow schedules and runs ETL pipelines (called DAGs — Directed Acyclic Graphs). Each DAG is a Python file that defines a sequence of tasks: extract data from a source database, transform it, and load it into the data warehouse.
+
+- **Trigger** pipelines manually or on a schedule
+- **Monitor** task status, logs, and retries
+- **Manage** connections and variables
+
+📺 Learn: [Apache Airflow Full Course – Beginner to Advanced](https://www.youtube.com/watch?v=K9AnJ9_ZAXE)
+
+---
+
+#### 🖥️ Web UI (ETL Manager) — http://localhost:5001
+A custom-built Flask web application that lets non-developers create and edit ETL job configurations through a form interface — no JSON editing or coding required.
+
+- Fill in a form → it generates the DAG config JSON and SQL files automatically
+- Changes appear in Airflow on the next scheduler cycle
+- Replaces manual editing of `dags/config/*.json` and `dags/sql/*.sql`
+
+---
+
+#### 📊 Pipeline Monitor — http://localhost:8050
+A Plotly Dash dashboard that shows real-time ETL metrics: how many records were loaded, which pipelines ran, and any failures. Built for operations teams to check data pipeline health at a glance.
+
+📺 Learn: [Plotly Dash Tutorial](https://www.youtube.com/watch?v=hSPmj7mK6ng)
+
+---
+
+#### 🔧 Jenkins — http://localhost:9090
+CI/CD (Continuous Integration / Continuous Deployment) server. Every time a developer merges a Pull Request to `main` on GitHub, Jenkins automatically pulls the latest code and deploys it to the server — no manual SSH required.
+
+- Triggers on every push to `main` (via GitHub webhook)
+- Runs `deploy.sh` which safely rsync's new code while preserving Web UI generated files
+- Build logs visible in the Jenkins UI
+
+📺 Learn: [Jenkins Full Course – DevOps](https://www.youtube.com/watch?v=FX322RVNGj4)
+
+---
+
+#### 🐘 PgAdmin — http://localhost:5050
+A web-based GUI for browsing and querying PostgreSQL databases. Use it to inspect the Airflow metadata DB, the data lake, or run SQL queries without needing a desktop client like DBeaver.
+
+- Login with `PGADMIN_DEFAULT_EMAIL` / `PGADMIN_DEFAULT_PASSWORD` from `~/.airflow`
+- Add a server connection: host `postgres`, port `5432`, user/password from `~/.airflow`
+
+📺 Learn: [PgAdmin 4 Tutorial](https://www.youtube.com/watch?v=-ZKlMKEMnTU)
+
+---
+
+#### 🗄️ PostgreSQL — localhost:55432
+The relational database engine powering the stack. Two databases run inside the same PostgreSQL container:
+
+| Database | Purpose |
+|---|---|
+| `airflow` | Airflow metadata — DAG runs, task states, logs |
+| *(your data lake DB)* | Source and warehouse data for ETL pipelines |
+
+Connect with any SQL client (DBeaver, psql, DataGrip) using host `localhost`, port `55432`.
+
+📺 Learn: [PostgreSQL Full Course](https://www.youtube.com/watch?v=qw--VYLpxG4)
+
+---
+
+#### 🔴 Redis — (internal, no UI)
+Message broker used by Airflow's Celery executor. Workers pick up tasks from the Redis queue and execute them in parallel. No direct interaction needed — it runs silently in the background.
+
+📺 Learn: [Redis Crash Course](https://www.youtube.com/watch?v=jgpVdJB2sKQ)
+
+---
+
+### 4. First-time Airflow setup
+
+On first run `airflow-init` creates the DB schema and the admin user defined by `_AIRFLOW_WWW_USER_USERNAME` / `_AIRFLOW_WWW_USER_PASSWORD` in your environment.
+
+Check init completed:
+```bash
+docker compose logs airflow-init --tail=50
+```
+
+### 5. Set Airflow Variables
+
+In the Airflow UI → **Admin → Variables**, create:
+
+| Key | Example value | Purpose |
+|---|---|---|
+| `environment` | `dev` | Controls which source/target block DAGs use (`dev` or `prod`) |
+| `modules_path` | `/opt/airflow/dags/modules` | Python modules location |
+| `config_path` | `/opt/airflow/dags/config` | JSON job config directory |
+| `sql_path` | `/opt/airflow/dags/sql` | SQL query files directory |
+| `etl_path` | `/opt/airflow/dags/etl` | Generated ETL DAG files |
+| `data_dump` | `/opt/airflow/data_dump` | CSV staging area |
+| `logs_path` | `/opt/airflow/logs` | Airflow log root |
+| `slack_token` | *(your token)* | **Sensitive** — Slack alerts (optional) |
+
+---
+
+## Web UI — ETL Job Manager
+
+Access at **http://localhost:5001** (default login: `admin` / `admin123`, change in `.dev_env`).
+
+The Web UI lets you **create, edit, and delete ETL job configs** without touching JSON files or the Airflow container.
+
+### How it works
+
+```
+Web UI (form submit)
+      │
+      ▼
+  dags/config/<dag_id>.json      ← saved JSON config (source of truth)
+  dags/sql/<dag_id>_dev.sql      ← SQL query for dev environment
+  dags/sql/<dag_id>_prod.sql     ← SQL query for prod environment
+      │
+      ▼
+  Airflow Scheduler reads dags/etl/**/*.py
+  Each ETL DAG reads its config + SQL at runtime
+```
+
+### Adding a new ETL job
+
+1. Open the Web UI → **+ New Job**
+2. Fill in the 4-step form:
+   - **Basics** — DAG ID, cron schedule, tags
+   - **Source** — connection, DB type, HWM column, SQL query (dev & prod)
+   - **Target** — connection, schema, table, load strategy (append / replace)
+   - **Review** — confirm and save
+3. The config JSON and SQL files are written automatically.
+4. Airflow picks up the DAG on the next scheduler heartbeat (no restart needed).
+
+### Job Config Structure (`dags/config/<dag_id>.json`)
+
+```json
+{
+  "dag_id": "my_pipeline",
+  "schedule_interval": "0 2 * * *",
+  "tags": ["admin", "finance"],
+  "source": {
+    "dev":  { "source_db_conn_id": "src_dev",  "sql_file": "my_pipeline_dev.sql",  "hwm_column": "updated_at", "hwm_datatype": "timestamp", "batch_size": 100, "full_load": false },
+    "prod": { "source_db_conn_id": "src_prod", "sql_file": "my_pipeline_prod.sql", "hwm_column": "updated_at", "hwm_datatype": "timestamp", "batch_size": 100, "full_load": false }
+  },
+  "target": {
+    "dev":  { "target_db_conn_id": "tgt_dev",  "target_schema": "public", "target_table": "my_table", "load_strategy": "append" },
+    "prod": { "target_db_conn_id": "tgt_prod", "target_schema": "public", "target_table": "my_table", "load_strategy": "append" }
+  }
+}
+```
+
+---
+
+## Project Structure
+
+```
+plengo_analytics/
+├── dags/
+│   ├── config/          ← ETL job configs (JSON) — managed by Web UI
+│   ├── sql/             ← SQL query files (one per job per env)
+│   ├── etl/             ← Generated ETL DAG Python files
+│   ├── modules/         ← Shared Python helpers (db_conn, utils)
+│   ├── custom_dags/     ← Hand-written Airflow DAGs (DW builder, backups, etc.)
+│   ├── dw_config/       ← DW dimension/fact configs
+│   ├── dw_sql/          ← DW stored procedures and views
+│   └── templates/       ← DAG .py template (data_load.template)
+├── web_ui/
+│   ├── app.py           ← Flask application
+│   ├── requirements.txt ← Web UI Python dependencies
+│   ├── webui.db         ← SQLite user auth DB (gitignored)
+│   ├── static/
+│   │   └── styles.css   ← UI stylesheet
+│   └── templates/       ← Jinja2 HTML templates
+├── data_pipeline_monitor/  ← Separate monitoring dashboard
+├── data_dumps/          ← CSV staging files (gitignored)
+├── logs/                ← Airflow logs (gitignored)
+├── docker-compose.yaml
+├── Dockerfile           ← Custom Airflow image with extra packages
+├── requirements.txt     ← Airflow extra Python packages
+├── .env                 ← Environment variable template with ${VAR} placeholders (safe to commit)
+└── .gitignore
+```
+
+---
+
+## ETL DAG Runtime Flow
+
+Each generated ETL DAG (`dags/etl/**/*.py`) follows this pattern at runtime:
+
+```
+1. Read config JSON  (path from Airflow Variable: config_path)
+2. Read SQL file     (path from Airflow Variable: sql_path)
+3. Determine environment  (Airflow Variable: environment → dev | prod)
+4. Connect to source DB  (Airflow Connection: source_db_conn_id)
+5. Extract data in chunks (batch_size rows, HWM-based incremental or full load)
+6. Stage to CSV          (data_dump path)
+7. Load to target DB     (Airflow Connection: target_db_conn_id, append or replace)
+8. Update HWM            (stored in DAG state / XCom)
+```
+
+---
+
+## Stopping / Restarting
+
+```bash
+make down                        # stop all containers
+make restart                     # stop + start
+make logs                        # tail all logs
+make restart-service s=web-ui    # restart one container
+make logs-service s=airflow-scheduler
+```
+
+### Nuclear reset — wipe everything and start fresh
+
+```bash
+docker stop $(docker ps -aq)
+docker rm $(docker ps -aq)
+docker rmi $(docker images -q)
+docker volume rm $(docker volume ls -q)
+```
+
+Or selectively for this stack only:
+
+```bash
+docker ps -a | grep plengo | awk '{print $1}' | xargs -r docker stop && \
+docker ps -a | grep plengo | awk '{print $1}' | xargs -r docker rm && \
+docker images | grep plengo | awk '{print $3}' | xargs -r docker rmi && \
+docker volume ls | grep plengo | awk '{print $2}' | xargs -r docker volume rm && \
+docker network ls | grep plengo | awk '{print $1}' | xargs -r docker network rm
+```
+
+---
+
+## Common Issues
+
+| Issue | Fix |
+|---|---|
+| Airflow webserver fails on first start | `airflow-init` hadn't finished yet. Run `make down` then `make` again once init exits with code 0. |
+| `Permission denied` on docker commands | Run `sudo usermod -aG docker $USER && newgrp docker` |
+| `.env` variables not substituted | Shell vars not exported — run `source ~/.airflow` then retry |
+| Port already in use | Another service is using the port — change the host port in `docker-compose.yaml` |
+
+---
+
+## ETL Pipeline — Known Issues & Fixes
+
+Operational issues encountered in production and how to resolve them.
+
+---
+
+### `pipeline.etl_metrics` does not exist
+
+**Error:**
+```
+psycopg2.errors.UndefinedTable: relation "pipeline.etl_metrics" does not exist
+```
+
+**Cause:** The `collect_metrics` task tries to INSERT before the schema/table exist (fresh install or new DB).
+
+**Fix:** The `collect_metrics_fn` function now auto-creates the schema and table with `CREATE SCHEMA/TABLE IF NOT EXISTS` before every INSERT — idempotent, no manual action needed. On first failure just **clear and re-run** the `collect_metrics` task in the Airflow UI.
+
+If you need to create it manually:
+```sql
+CREATE SCHEMA IF NOT EXISTS pipeline;
+CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+    id                          SERIAL PRIMARY KEY,
+    dag_id                      TEXT,
+    env                         TEXT,
+    schema                      TEXT,
+    table_name                  TEXT,
+    run_id                      TEXT,
+    run_start                   TIMESTAMP WITH TIME ZONE,
+    run_end                     TIMESTAMP WITH TIME ZONE,
+    run_duration_secs           INTEGER,
+    run_status                  TEXT NOT NULL DEFAULT 'success',
+    error_msg                   TEXT,
+    batch_size                  INTEGER,
+    rows_loaded_now             BIGINT,
+    target_total_records        BIGINT,
+    target_today_records        BIGINT,
+    target_max_upload_date      TIMESTAMP,
+    target_first_upload_date    TIMESTAMP,
+    target_max_incremental      TEXT,
+    source_total_records        BIGINT,
+    source_max_incremental      TEXT,
+    source_loaded_to_max_target BIGINT,
+    perc_loaded                 NUMERIC(6,2),
+    created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+```
+
+---
+
+### DAG skips `process_data` and `load_data` — goes straight to `no_new_rows`
+
+**Symptom:** Extraction shows 0 rows even though data exists in the source.
+
+**Cause:** `_hwm_expressions()` was called with `last_loaded=None` to get `order_expr` for the temp table index. For numeric HWM columns this called `int(None)`, raising a `TypeError` inside the SQLAlchemy connection context. The exception exits the connection silently, `row_count` stays 0, and the branch routes to `no_new_rows`.
+
+**Fix:** `_hwm_expressions()` now returns `where_clause=None` when `last_loaded=None` instead of trying to format it. No manual action needed — this is fixed in the template and all generated DAGs.
+
+**If you see this on an existing DAG generated before the fix**, regenerate it via the Web UI or copy the updated `data_load.template` logic into the generated file.
+
+---
+
+### First load ignores `batch_size` and loads all rows
+
+**Symptom:** Config has `"batch_size": 1000` but first run loads all 10,000+ rows.
+
+**Cause:** `batch_size` was defined in two places in the config JSON — top-level (`"batch_size": 0`) and inside the env-specific `source` block (`"batch_size": 1000`). `extract_data` read the top-level value (0), so `LIMIT` was never applied.
+
+**Fix:** `load_config` now reads `batch_size` from `source_cfg` first (env-specific), falling back to the top-level value. `extract_data` reads `CONFIG["source"]["batch_size"]`. Ensure your config has `batch_size` inside the env block:
+
+```json
+"source": {
+  "dev": {
+    "batch_size": 1000,
+    ...
+  }
+}
+```
+
+---
+
+### `source_total_records` / `source_max_incremental` / `perc_loaded` always NULL in metrics
+
+**Cause:** The config uses a `sql_file` instead of explicit `source_table_schema` + `source_table_name`. The guard `if source_schema and source_table_name:` evaluated to `False` and the entire source stats block was skipped.
+
+**Fix:** When no explicit table name is configured, `collect_metrics_fn` now wraps the SQL file query as a subquery:
+```sql
+SELECT COUNT(*) FROM (<sql_file_contents>) _src
+```
+This works for any SQL — simple tables, JOINs, CTEs, or views.
+
+If you still see NULLs after the fix, check the Airflow task log for:
+```
+collect_metrics: could not query source stats: ...
+```
+This will show the actual error (connection issue, SQL syntax, etc.).
+
+---
+
+### Pipeline Monitor dashboard — connection refused
+
+**Error:**
+```
+psycopg2.OperationalError: connection to server at "<ip>", port 5432 failed: Connection refused
+```
+
+**Cause:** The `pipeline-monitor` Docker service was configured to connect to `POSTGRES_DATA_*` (the external data lake), but `pipeline.etl_metrics` lives in the **Airflow postgres** container.
+
+**Fix:** The `pipeline-monitor` service in `docker-compose.yaml` now connects to the internal `postgres` service (same Docker network) using `AIRFLOW__CORE__SQL_ALCHEMY_CONN` as the primary connection source — the same variable used by all Airflow services — with `DB_*` vars as fallback.
+
+**Connection resolution priority in `dashboard.py`:**
+1. `AIRFLOW__CORE__SQL_ALCHEMY_CONN` (or `AIRFLOW__DATABASE__SQL_ALCHEMY_CONN`) — auto-parsed
+2. Individual `DB_USER` / `DB_PASS` / `DB_HOST` / `DB_PORT` / `DB_NAME` env vars
+3. Hardcoded defaults: `airflow:airflow@localhost:55432/airflow`
+
+**For local development** (running dashboard outside Docker):
+```bash
+# data_pipeline_monitor/.env
+DB_USER=airflow
+DB_PASS=airflow
+DB_HOST=localhost
+DB_PORT=55432
+DB_NAME=airflow
+```
+
+**After any connection config change**, rebuild the container:
+```bash
+docker compose up -d --build pipeline-monitor
+```
+
+---
+
+### `load_data` is skipped but `no_new_rows` state shows `success` in metrics
+
+**Symptom:** `run_status` shows `success` in `pipeline.etl_metrics` even though no data was loaded.
+
+**Fix:** `collect_metrics_fn` now checks the `no_new_rows` task instance state. If it succeeded, `run_status` is set to `no_new_rows` (distinct from `success`) and `rows_loaded_now` is explicitly set to 0.
+
+**Dashboard status colour coding:**
+| Status | Meaning | Colour |
+|---|---|---|
+| `success` | Data was extracted and loaded | 🟢 Green |
+| `no_new_rows` | Ran clean, source had no new rows | 🔵 Blue |
+| `failed` | A task failed upstream | 🔴 Red |
+
+---
+
+## Optional: Spark Cluster
+
+> **Disabled by default.** The stack runs on pandas-based ETL out of the box.  
+> Enable Spark only when you have dedicated compute nodes available.
+
+### Architecture with Spark
+
+```
+┌─────────────────────┐        ┌──────────────────────┐
+│  Airflow Server     │        │  Spark Master Node   │
+│  (this repo)        │──────▶ │  spark://master:7077 │
+│                     │        └──────────┬───────────┘
+└─────────────────────┘                   │
+                                ┌─────────▼──────────┐
+                                │  Spark Worker Node │  (add as many as needed)
+                                └────────────────────┘
+```
+
+### 1. Install Java on every node (master + workers)
+
+```bash
+sudo apt-get update -y
+sudo apt-get install -y openjdk-11-jre-headless
+java -version
+```
+
+### 2. Install Spark on the master node
+
+```bash
+wget https://downloads.apache.org/spark/spark-3.4.4/spark-3.4.4-bin-hadoop3.tgz
+tar -xzf spark-3.4.4-bin-hadoop3.tgz
+sudo mv spark-3.4.4-bin-hadoop3 /opt/spark
+echo 'export SPARK_HOME=/opt/spark' >> ~/.bashrc
+echo 'export PATH=$PATH:$SPARK_HOME/bin:$SPARK_HOME/sbin' >> ~/.bashrc
+source ~/.bashrc
+```
+
+### 3. Configure workers
+
+```bash
+# On master — add worker IPs (one per line)
+nano /opt/spark/conf/workers
+# e.g.:
+# 10.0.0.11
+# 10.0.0.12
+
+# Copy Spark to each worker node
+scp -r /opt/spark user@10.0.0.11:/opt/spark
+```
+
+### 4. Start the Spark cluster
+
+```bash
+# On master
+/opt/spark/sbin/start-master.sh
+/opt/spark/sbin/start-workers.sh spark://$(hostname):7077
+
+# Verify at http://<master-ip>:8080
+```
+
+### 5. Enable Spark in this project
+
+**`requirements.txt`** — uncomment:
+```
+pyspark==3.4.4
+```
+
+**`Dockerfile`** — uncomment the `Optional: Spark support` block.
+
+**`spark_config.json`** (recreate in project root) — update master URL:
+```json
+{
+  "spark": {
+    "use_spark": true,
+    "master": "spark://<master-ip>:7077"
+  }
+}
+```
+
+Then rebuild:
+```bash
+make down
+docker compose --env-file .env up -d --build
+```
+
+---
+
+## Git Workflow (GitHub Desktop)
+
+### Contributing changes — feature branch workflow
+
+Never commit directly to `main`. Always work on a feature branch.
+
+#### 1. Sync with latest `main`
+- Open **GitHub Desktop**
+- Make sure current branch is `main`
+- Click **Fetch origin** → **Pull origin**
+
+#### 2. Create a feature branch
+- Click the **Current Branch** dropdown → **New Branch**
+- Name it clearly: e.g. `feature/add-customers-dag` or `fix/etl-connection`
+- Click **Create Branch**
+
+#### 3. Make your changes
+- Open your files in VS Code or any editor and make changes
+- GitHub Desktop will show all modified files under **Changes**
+
+#### 4. Commit your changes
+- In GitHub Desktop, review the changed files
+- Add a summary (e.g. `Add customers ETL dag`) and optional description
+- Click **Commit to feature/your-branch-name**
+
+#### 5. Push to GitHub
+- Click **Publish branch** (first time) or **Push origin**
+
+#### 6. Open a Pull Request
+- GitHub Desktop will show a banner → click **Create Pull Request**
+- Or go to **github.com → pleasurengobeni/datapipeline → Pull requests → New pull request**
+  - Base: `main` ← Compare: `feature/your-branch-name`
+- Add a title and description → **Create pull request**
+
+#### 7. Wait for approval
+- At least **1 team member must approve** before the PR can be merged
+- Reviewer: go to the PR → **Files changed** → review → **Approve** → **Submit review**
+- Once approved: click **Merge pull request** → **Confirm merge**
+
+#### 8. Clean up
+- After merge, in GitHub Desktop switch back to `main` → **Pull origin**
+- Delete the feature branch: **Branch menu → Delete branch**
+
+---
+
+### Branch Protection Setup (set up once by repo admin)
+
+Protects `main` from direct pushes, force pushes, deletions, and unreviewed merges.
+
+**Step 1 — Open branch rules**
+- Go to **https://github.com/pleasurengobeni/datapipeline**
+- Click **Settings** (top tab)
+- In the left sidebar click **Rules** → **Rulesets**
+- Click **New ruleset** → **New branch ruleset**
+
+**Step 2 — Name and activate**
+| Field | Value |
+|---|---|
+| Ruleset Name | `Protect main` |
+| Enforcement status | `Active` |
+
+**Step 3 — Target the main branch**
+- Under **Target branches** → click **Add target** → **Include by pattern**
+- Type `main` → click **Add**
+
+**Step 4 — Enable these rules**
+| Rule | What it does |
+|---|---|
+| ✅ **Restrict deletions** | Nobody can delete the `main` branch |
+| ✅ **Block force pushes** | Nobody can overwrite history with `git push --force` |
+| ✅ **Require a pull request before merging** | All changes must go through a PR — no direct pushes to `main` |
+| → Required approvals: **1** | At least 1 team member must approve before merge |
+| → **Dismiss stale pull request approvals when new commits are pushed** | If the author pushes new commits after approval, the approval is reset |
+| → **Require conversation resolution before merging** | All review comments must be resolved before merge (recommended) |
+
+**Step 5 — Save**
+- Scroll to the bottom → click **Create**
+
+> **Result:** GitHub Desktop will show an error if anyone tries to push directly to `main`. All changes must go through a reviewed Pull Request. Jenkins auto-deploys once the PR is merged. ✅
+
+---
+
+## Future Plans — AI & Advanced Capabilities
+
+The following capabilities are planned for future releases to extend the platform beyond standard ETL orchestration.
+
+---
+
+### 🟢 Anomaly Detection on ETL Metrics *(Near-term)*
+
+Use the `pipeline.etl_metrics` data already being collected to automatically detect abnormal pipeline behaviour.
+
+- Detect sudden drops in `rows_loaded_now`, spikes in `run_duration_secs`, or regression in `perc_loaded` using statistical models (Isolation Forest, Z-score)
+- Alert via Slack when anomalies are detected
+- Surface a **"⚠️ Anomaly"** badge per pipeline in the Pipeline Monitor dashboard
+- Results stored in a new `pipeline.etl_anomalies` table — no extra infrastructure needed
+
+**Implementation:** A nightly Airflow DAG reads `etl_metrics`, scores each pipeline, writes anomaly flags back to Postgres. The dashboard queries them on the next refresh.
+
+---
+
+### 🟡 Automated Data Quality Scoring *(Medium-term)*
+
+After each load, automatically profile the target table and produce a quality score (0–100):
+
+| Check | What it measures |
+|---|---|
+| **Completeness** | % of NULL values per column |
+| **Uniqueness** | Duplicate primary key detection |
+| **Freshness** | Is `max(updated_at)` older than the expected schedule? |
+| **Distribution drift** | Has the range or mean of numeric columns shifted significantly? |
+
+Results displayed on a dedicated **Data Quality** tab in the Pipeline Monitor dashboard.
+
+**Tools:** [Great Expectations](https://greatexpectations.io/) or a lightweight custom implementation using pandas/SQLAlchemy — runs inside the existing Airflow worker, no new services required.
+
+---
+
+### 🟡 Natural Language Querying (Text-to-SQL) *(Medium-term)*
+
+Add an AI-powered query box to the Pipeline Monitor or Web UI. Users type plain-English questions and get instant results:
+
+> *"Show me all tables where coverage is below 50%"*  
+> *"Which pipelines failed in the last 3 days?"*  
+> *"What was the average load duration for fhvhv_tripdata this week?"*
+
+An LLM (OpenAI API or self-hosted [Ollama](https://ollama.com/)) converts the question to SQL, executes it against `etl_metrics` or the data warehouse, and returns the result as a table or chart — no SQL knowledge required.
+
+**Stack:** A small endpoint in the Web UI backend calls the LLM API, validates the returned SQL, runs it via SQLAlchemy, and returns JSON to the UI.
+
+---
+
+### 🔴 LLM-Powered DAG Generation *(Advanced)*
+
+Replace the current multi-step Web UI form with a plain-English interface:
+
+> *"Load the customers table from the invoicing system every hour, incremental on updated_at, batch size 500"*
+
+An LLM generates the config JSON and SQL file, which the existing DAG template system converts into a runnable Airflow DAG — no form filling, no JSON editing.
+
+**Stack:** OpenAI / Ollama + existing Web UI backend. LLM output is validated against the config schema before being written to `dags/config/`.
+
+---
+
+### 🔴 Predictive Load Scheduling *(Advanced)*
+
+Replace fixed cron schedules with ML-driven dynamic scheduling:
+
+- Predict **when** a source table is likely to have new data based on historical patterns
+- Recommend optimal **batch size** to complete within a target time window
+- Identify pipelines at risk of falling behind before they fail
+
+**Tools:** scikit-learn time-series models trained on `etl_metrics`, deployed as an Airflow DAG that updates pipeline schedules via the Airflow REST API.
+
+---
+
+## Developed by
+
+[Cenfri.org](https://cenfri.org) — Data Team  
+📧 [datateam@cenfri.org](mailto:datateam@cenfri.org)

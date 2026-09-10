@@ -1,0 +1,90 @@
+# Falco configuration for WASAC analytics pipeline
+# Docs: https://falco.org/docs/reference/daemon/config-options/
+
+engine:
+  kind: modern_ebpf
+
+rules_files:
+  - /etc/falco/falco_rules.yaml
+  - /etc/falco/falco_rules.local.yaml
+  - /etc/falco/rules.d
+
+# Falco 0.41+ moved container enrichment (container.name/container.id, used
+# throughout custom_rules.yaml to scope rules to specific containers) out of
+# the core engine into this plugin — the built-in rules now hard-require it
+# ("Plugin requirement not satisfied, must load one of: container (>= 0.4.0)",
+# confirmed concretely on upgrading from 0.38.1). The plugin auto-prepends
+# HOST_ROOT (/host, same as this file's other host-mount consumers) to
+# socket paths itself — confirmed concretely: giving it "/host/..." here
+# produced "/host/host/var/run/docker.sock" in the logs. Path below is the
+# plain in-container path (/var/run/docker.sock, i.e. the host's
+# docker.sock per docker-compose.security.yaml's mount) — no /host prefix.
+plugins:
+  - name: container
+    library_path: libcontainer.so
+    init_config:
+      label_max_len: 100
+      with_size: false
+      hooks: ["create", "start"]
+      # Every engine key is required by this plugin version's schema even
+      # to disable it (confirmed concretely: omitting "bpm" alone failed
+      # with "Missing required property 'bpm'") — only docker is relevant
+      # to this stack, everything else explicitly off.
+      engines:
+        docker:
+          enabled: true
+          sockets: ["/var/run/docker.sock"]
+        podman:
+          enabled: false
+        containerd:
+          enabled: false
+        cri:
+          enabled: false
+        lxc:
+          enabled: false
+        libvirt_lxc:
+          enabled: false
+        bpm:
+          enabled: false
+
+load_plugins: [container]
+
+# JSON output for structured log ingestion
+json_output: true
+json_include_output_property: true
+json_include_tags_property: true
+
+# Write alerts to a dedicated file (separate from container stdout)
+file_output:
+  enabled: true
+  keep_alive: false
+  filename: /var/log/falco/alerts.log
+
+# Also print to stdout so docker logs captures it
+stdout_output:
+  enabled: true
+
+log_stderr: true
+log_syslog: false
+log_level: info
+
+# Suppress known-safe noisy syscalls to reduce false positives
+syscall_event_drops:
+  actions:
+    - log
+    - alert
+  rate: 0.03333
+  max_burst: 10
+
+buffered_outputs: false
+
+# NOTE: the old global `outputs: {rate, max_burst}` throttle from Falco
+# 0.38 no longer exists in 0.44's schema (confirmed: "Object contains a
+# property that could not be validated ... 'outputs'") and has no direct
+# 1:1 replacement — outputs_queue (capacity, default unbounded) governs
+# queue depth, not alert rate. Dropped rather than guess at a replacement;
+# syscall_event_drops above still throttles noisy syscall-drop alerts
+# specifically and is unaffected.
+
+# Priority threshold — only alert on WARNING and above
+priority: WARNING

@@ -1,0 +1,512 @@
+# ── Docker secrets ────────────────────────────────────────────────────────────
+# Secret files live in ./secrets/ (gitignored, created by `make init-secrets`).
+# They are mounted read-only at /run/secrets/<name> inside each container.
+# Nothing sensitive appears in `docker inspect` or shell environment this way.
+# Fallback: if ./secrets/<name> does not exist, the container reads the value
+# from the corresponding environment variable (for backwards compatibility).
+x-secrets: &all-secrets
+  - postgres_user
+  - postgres_password
+  - airflow_fernet_key
+  - airflow_webserver_secret_key
+  - airflow_www_user_password
+  - webui_secret_key
+  - webui_admin_user
+  - webui_admin_pass
+  - webui_fernet_key
+
+x-airflow-common:
+  &airflow-common
+  build: .
+  # Wrapper reads /run/secrets/* → exports env vars → exec /entrypoint
+  entrypoint: ["/bin/bash", "/run/airflow-entrypoint.sh"]
+  secrets: *all-secrets
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER must be set explicitly, no insecure default}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set explicitly, no insecure default}@postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER must be set explicitly, no insecure default}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set explicitly, no insecure default}@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${POSTGRES_USER:?POSTGRES_USER must be set explicitly, no insecure default}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set explicitly, no insecure default}@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set explicitly, no insecure default}@redis:6379/0
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW__WEBSERVER__SECRET_KEY:-}
+    AIRFLOW_SERVER_IP: ${AIRFLOW_SERVER_IP:-localhost}
+    PROJECT_NAME: ${PROJECT_NAME:-project}
+    # Do NOT use _PIP_ADDITIONAL_REQUIREMENTS — all deps must be baked into the image
+    _PIP_ADDITIONAL_REQUIREMENTS: ''
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: '30'
+    AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC: '10'
+    AIRFLOW__SCHEDULER__PARSING_PROCESSES: '1'
+    AIRFLOW__WEBSERVER__WARN_DEPLOYMENT_EXPOSURE: 'False'
+    AIRFLOW__SCHEDULER__SCHEDULER_HEALTH_CHECK_THRESHOLD: '60'
+    # Log retention — Airflow task logs older than this are eligible for cleanup
+    AIRFLOW__LOG__LOG_RETENTION_IN_DAYS: '30'
+    # Enable the built-in daily log cleanup (scheduler picks this up)
+    AIRFLOW__LOGGING__LOG_RETENTION_DAYS: '30'
+    SPARK_CLASSPATH: "/opt/airflow/jars/postgresql-42.7.3.jar:/opt/airflow/jars/mysql-connector-j-8.4.0.jar:/opt/airflow/jars/mssql-jdbc-12.6.1.jre11.jar"
+    PYSPARK_SUBMIT_ARGS: "--jars /opt/airflow/jars/postgresql-42.7.3.jar,/opt/airflow/jars/mysql-connector-j-8.4.0.jar,/opt/airflow/jars/mssql-jdbc-12.6.1.jre11.jar pyspark-shell"
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/cleaning_files:/opt/airflow/cleaning_files:ro
+    - ${DATA_DUMPS_DIR:-./data_dumps}:/opt/airflow/data_dump:rw
+    # Secrets entrypoint wrapper — read-only
+    - ./scripts/airflow-entrypoint.sh:/run/airflow-entrypoint.sh:ro
+  user: "${AIRFLOW_UID:-50000}"
+  networks:
+    - airflow-net
+    - backend-internal
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    &default-logging
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "10"
+      tag: "{{.Name}}"
+  depends_on:
+    &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13-bookworm
+    environment:
+      # Native file-based secret support — no plaintext password in env
+      POSTGRES_USER_FILE: /run/secrets/postgres_user
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_DB: airflow
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    secrets:
+      - postgres_user
+      - postgres_password
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+      - ./init-user-db.sh:/docker-entrypoint-initdb.d/init-user-db.sh
+      - ./postgres-allow-remote.sh:/docker-entrypoint-initdb.d/postgres-allow-remote.sh
+    networks:
+      - backend-internal
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    logging:
+      <<: *default-logging
+    restart: always
+
+  redis:
+    # Pinned version — do not use :latest (prevents silent supply-chain drift)
+    image: redis:7.2.5-alpine
+    environment:
+      # Read by redis-cli automatically (incl. the healthcheck below) — keeps
+      # the password out of the process arg list (`ps aux`), unlike `-a`.
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set explicitly, no insecure default}
+    expose:
+      - 6379
+    networks:
+      - backend-internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    command: >
+      redis-server
+      --protected-mode yes
+      --bind 0.0.0.0
+      --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set explicitly, no insecure default}
+      --loglevel notice
+      --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 30s
+      retries: 50
+    logging:
+      <<: *default-logging
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    env_file:
+      - .env
+    command: webserver
+    ports:
+      # Open — web application UI, meant to be browser-reachable
+      - "8090:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    env_file:
+      - .env
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 30s
+      retries: 10
+      start_period: 60s
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-worker:
+    <<: *airflow-common
+    env_file:
+      - .env
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    env_file:
+      - .env
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    env_file:
+      - .env
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        function ver() {
+          printf "%04d%04d%04d%04d" $${1//./ }
+        }
+        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        airflow_version_comparable=$$(ver $${airflow_version})
+        min_airflow_version=2.2.0
+        min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        if (( airflow_version_comparable < min_airflow_version_comparable )); then
+          echo -e "\033[1;31mERROR!!!: Too old Airflow version $${airflow_version}!\e[0m"
+          exit 1
+        fi
+        one_meg=1048576
+        mem_available=$$(($$(getconf _PHYS_PAGES) * $$(getconf PAGE_SIZE) / one_meg))
+        cpus_available=$$(grep -cE 'cpu[0-9]+' /proc/stat)
+        disk_available=$$(df / | tail -1 | awk '{print $$4}')
+        if (( mem_available < 4000 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough memory available for Docker.\e[0m"
+        fi
+        if (( cpus_available < 2 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough CPUS available for Docker.\e[0m"
+        fi
+        if (( disk_available < one_meg * 10 )); then
+          echo -e "\033[1;33mWARNING!!!: Not enough Disk space available for Docker.\e[0m"
+        fi
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        # Only chown the top-level logs dir — NOT recursively.
+        # Recursive chown over 100k+ task log files is the main reason init
+        # takes minutes on a busy server. Airflow creates log files with the
+        # correct UID at runtime so the directory just needs to be writable.
+        chown "${AIRFLOW_UID:-50000}:0" /sources/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /sources/dags /sources/plugins
+        /entrypoint airflow version
+        exec /entrypoint airflow db init
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_UPGRADE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:?_AIRFLOW_WWW_USER_PASSWORD must be set explicitly, no insecure default}
+      _PIP_ADDITIONAL_REQUIREMENTS: ''
+    # init runs as root to chown directories — security_opt deliberately omitted here
+    user: "0:0"
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    logging:
+      <<: *default-logging
+
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+
+  web-ui:
+    build:
+      context: .
+      dockerfile: web_ui/Dockerfile
+    image: ${PROJECT_NAME_LOWER:-project}_web_ui:latest
+    secrets: *all-secrets
+    working_dir: /app
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/app
+      - ${DATA_DUMPS_DIR:-./data_dumps}:/app/data_dumps:rw
+    environment:
+      FLASK_APP: web_ui/app.py
+      # production disables the debugger and interactive error pages
+      FLASK_ENV: production
+      FLASK_DEBUG: "0"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-}
+      WEBUI_ADMIN_USER: ${WEBUI_ADMIN_USER:-admin}
+      WEBUI_ADMIN_PASS: ${WEBUI_ADMIN_PASS:-}
+      WEBUI_DB: /app/web_ui/webui.db
+      CONFIG_DIR: /app/dags/config
+      ETL_DIR: /app/dags/etl
+      TEMPLATE_PATH: /app/dags/templates/data_load.template
+      SQL_DIR: /app/dags/sql
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER must be set explicitly, no insecure default}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set explicitly, no insecure default}@postgres/airflow
+      AIRFLOW_VAR_environment: ${AIRFLOW_VAR_ENVIRONMENT:-dev}
+      AIRFLOW_VAR_DATA_DUMP: ${AIRFLOW_VAR_DATA_DUMP:-/opt/airflow/data_dump}
+      INCOMING_DIR: /app/data_dumps/incoming
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY:-}
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      SAMBANOVA_API_KEY: ${SAMBANOVA_API_KEY:-}
+      AIRFLOW_SERVER_IP: ${AIRFLOW_SERVER_IP:-localhost}
+      PROJECT_NAME: ${PROJECT_NAME:-project}
+    ports:
+      # Open — web application UI, meant to be browser-reachable
+      - "5001:5001"
+    networks:
+      - airflow-net
+      - backend-internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # web-ui writes ETL config JSON / generated DAG files across the whole
+    # mounted project dir (an authenticated internal admin tool, not a
+    # network-facing parser) — files/dirs under dags/config are frequently
+    # owned by whichever host user last touched them, not this container's
+    # uid, so root here needs DAC_OVERRIDE to actually write them. Without
+    # it, saving a new ETL job fails with EACCES even though the process
+    # runs as uid 0.
+    cap_add:
+      - DAC_OVERRIDE
+    tmpfs:
+      - /tmp:noexec,nosuid,size=128m
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      - postgres
+    command: python -m flask run --host 0.0.0.0 --port 5001
+
+  analytics:
+    build:
+      context: .
+      dockerfile: analytics/Dockerfile
+    image: ${PROJECT_NAME_LOWER:-project}_analytics:latest
+    working_dir: /app
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}:/app
+    environment:
+      CONFIG_DIR: /app/dags/config
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER must be set explicitly, no insecure default}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set explicitly, no insecure default}@postgres/airflow
+      AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY:-}
+      AIRFLOW_VAR_environment: ${AIRFLOW_VAR_ENVIRONMENT:-dev}
+      GOOGLE_AI_API_KEY: ${GOOGLE_AI_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
+      SAMBANOVA_API_KEY: ${SAMBANOVA_API_KEY:-}
+      AIRFLOW_SERVER_IP: ${AIRFLOW_SERVER_IP:-localhost}
+      PROJECT_NAME: ${PROJECT_NAME:-project}
+    ports:
+      # Open — web application UI, meant to be browser-reachable
+      - "8501:8501"
+    networks:
+      - airflow-net
+      - backend-internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:noexec,nosuid,size=128m
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      - postgres
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    profiles:
+      - flower
+    ports:
+      - "127.0.0.1:5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    logging:
+      <<: *default-logging
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  pipeline-monitor:
+    build:
+      context: ./data_pipeline_monitor
+    ports:
+      # Open — web application UI, meant to be browser-reachable
+      - "8050:8050"
+    # No env_file here (deliberately — see below). This container is
+    # unauthenticated and network-exposed (0.0.0.0:8050, no login), so unlike
+    # every other service it must NOT get `env_file: .env` — that directive
+    # imports every key in .env verbatim, not just the ones this app uses.
+    # Confirmed concretely: with env_file: .env attached, `docker inspect`
+    # showed this container holding the Airflow webserver secret, webui
+    # secret/admin password, pgadmin password, a Slack token, and more —
+    # none of which pipeline-monitor has any use for. Every var it actually
+    # needs is listed explicitly below instead.
+    #
+    # Fernet key + Airflow metadata DB creds come from Docker secrets (files
+    # under /run/secrets/, read by dashboard.py's _secret() helper — same
+    # pattern as web_ui's _secret()), NOT from environment: interpolation.
+    # A ${VAR} value gets baked into the container's env and shows up
+    # verbatim in `docker inspect` on the host; a secret file mounted here
+    # does not. This container now holds the master key that decrypts every
+    # Airflow connection password, so it gets the same treatment as
+    # airflow-common/web-ui rather than the plaintext-env-var shortcut.
+    secrets: *all-secrets
+    environment:
+      # Legacy single-connection fallback, only used if job configs / Airflow
+      # metadata aren't reachable from this container (see CONFIG_DIR below).
+      DB_USER: ${METRICS_DB_USER:-}
+      DB_PASS: ${METRICS_DB_PASS:-}
+      DB_HOST: ${METRICS_DB_HOST:-}
+      DB_PORT: ${METRICS_DB_PORT:-5432}
+      DB_NAME: ${METRICS_DB_NAME:-}
+      METRICS_LOOKBACK_DAYS: ${METRICS_LOOKBACK_DAYS:-30}
+      ALLOW_METRICS_ON_AIRFLOW_DB: ${ALLOW_METRICS_ON_AIRFLOW_DB:-0}
+      # pipeline.etl_metrics is not one shared table — each job's
+      # collect_metrics_fn writes it to ITS OWN target database. This lets
+      # the dashboard enumerate every job's target_db_conn_id (CONFIG_DIR)
+      # and resolve each one to real connection details via Airflow's own
+      # metadata (same approach web_ui's _engine_for_conn_id uses), instead
+      # of only ever showing whichever single DB METRICS_DB_* points at.
+      CONFIG_DIR: /app/dags/config
+    volumes:
+      - ./data_pipeline_monitor/data:/app/data
+      - ./data_pipeline_monitor/dashboard.py:/app/dashboard.py
+      - ${AIRFLOW_PROJ_DIR:-.}/dags/config:/app/dags/config:ro
+    networks:
+      - airflow-net
+      - backend-internal
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    logging:
+      <<: *default-logging
+    depends_on:
+      - postgres
+    restart: always
+
+networks:
+  # Airflow services + web UIs — internet-capable (workers need external DB access)
+  airflow-net:
+    driver: bridge
+  # Postgres + Redis — no outbound internet route
+  backend-internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  postgres-db-volume:
+  postgres:
+  pgadmin:
+  jenkins_home:
+
+# ── Secret file declarations ──────────────────────────────────────────────────
+# Run `make init-secrets` once to create ./secrets/ from ~/.airflow.
+# If a secrets file doesn't exist the service will still start (env var fallback).
+secrets:
+  postgres_user:
+    file: ./secrets/postgres_user
+  postgres_password:
+    file: ./secrets/postgres_password
+  airflow_fernet_key:
+    file: ./secrets/airflow_fernet_key
+  airflow_webserver_secret_key:
+    file: ./secrets/airflow_webserver_secret_key
+  airflow_www_user_password:
+    file: ./secrets/airflow_www_user_password
+  webui_secret_key:
+    file: ./secrets/webui_secret_key
+  webui_admin_user:
+    file: ./secrets/webui_admin_user
+  webui_admin_pass:
+    file: ./secrets/webui_admin_pass
+  webui_fernet_key:
+    file: ./secrets/webui_fernet_key

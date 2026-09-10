@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{% if pipeline_type == 'file_based' %}File ETL Jobs{% else %}ETL Jobs{% endif %}</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+  <style>
+    .badge-file  { display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700;background:#f0fdf4;color:#166534;border:1px solid #86efac; }
+    .badge-db    { display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700;background:#eff6ff;color:#1e40af;border:1px solid #bfdbfe; }
+    .badge-spark { display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700;background:#fdf4ff;color:#7e22ce;border:1px solid #e9d5ff; }
+    .badge-api   { display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:12px;font-size:10px;font-weight:700;background:#eef2ff;color:#3730a3;border:1px solid #a5b4fc; }
+    .nav-pills { display:flex;gap:8px;margin-bottom:18px; }
+    .nav-pill  { padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;text-decoration:none;color:#6b7a90;background:#f3f4f6;border:1px solid #e5e7eb; }
+    .nav-pill.active { background:#3b82f6;color:#fff;border-color:#3b82f6; }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('catalog') }}">&#128218; Catalog</a>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>
+        {% if pipeline_type == 'file_based' %}&#128196; File ETL Jobs <span style="font-weight:400;font-size:13px;color:#9ca3af;">(legacy)</span>
+        {% elif pipeline_type == 'hybrid' %}&#9889; Hybrid Jobs <span style="font-weight:400;font-size:13px;color:#9ca3af;">(File / DB / API)</span>
+        {% else %}&#128257; DB-to-DB ETL Jobs <span style="font-weight:400;font-size:13px;color:#9ca3af;">(legacy)</span>{% endif %}
+      </h1>
+      {% if pipeline_type == 'hybrid' %}
+        <a class="btn btn-primary" href="{{ url_for('new_hybrid_job') }}">+ New Job</a>
+      {% endif %}
+      {# File-based / DB-to-DB are legacy — no "+ New" here anymore, Hybrid
+         Jobs (File/DB/API) is the one job-creation surface. Existing jobs
+         of these types still show up on their own list/edit pages below. #}
+    </div>
+
+    {# ── Pipeline-type tab switcher — Hybrid Jobs is primary; the legacy
+         types only appear here at all when this page IS one of them, so a
+         user who followed a legacy edit link can still get back to it. ── #}
+    <div class="nav-pills">
+      <a class="nav-pill {% if pipeline_type == 'hybrid' %}active{% endif %}"
+         href="{{ url_for('hybrid_jobs') }}">&#9889; Hybrid Jobs</a>
+      {% if pipeline_type == 'file_based' %}
+      <a class="nav-pill active" href="{{ url_for('file_jobs') }}">&#128196; File-Based (legacy)</a>
+      {% elif pipeline_type not in ('file_based', 'hybrid') %}
+      <a class="nav-pill active" href="{{ url_for('jobs') }}">&#128257; DB-to-DB (legacy)</a>
+      {% endif %}
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+        <div class="alert {% if cat == 'error' %}alert-error{% endif %}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card">
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>DAG ID</th>
+            <th>Type</th>
+            <th>Schedule</th>
+            <th>Tags</th>
+            <th>Created</th>
+            <th>Last Modified</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for job in jobs %}
+          <tr>
+            <td>{{ job.dag_id }}</td>
+            <td>
+              {% if job.get('spark') %}
+                {% if pipeline_type == 'file_based' %}
+                  <span class="badge-spark">&#9889; Spark File</span>
+                {% else %}
+                  <span class="badge-spark">&#9889; Spark</span>
+                {% endif %}
+              {% elif pipeline_type == 'hybrid' %}
+                {# Hybrid Jobs lists File/DB/API together — badge shows which
+                   source_type this particular row actually is. #}
+                {% if job.source_type == 'api' %}
+                  <span class="badge-api">&#127760; API</span>
+                {% elif job.source_type == 'db' %}
+                  <span class="badge-db">&#128421; DB</span>
+                {% else %}
+                  <span class="badge-file">&#128196; File</span>
+                {% endif %}
+              {% elif pipeline_type == 'file_based' %}
+                <span class="badge-file">&#128196; File / Pandas</span>
+              {% else %}
+                <span class="badge-db">&#128040; DB / Pandas</span>
+              {% endif %}
+            </td>
+            <td>{{ job.schedule_interval }}</td>
+            <td>
+              <div class="tags-row">
+                {% for t in (job.tags or []) %}
+                  <span class="tag">{{ t }}</span>
+                {% endfor %}
+              </div>
+            </td>
+            <td style="white-space:nowrap;font-size:12px;color:#6b7a90;">{{ job.get('created_at', '—') }}</td>
+            <td style="white-space:nowrap;font-size:12px;color:#6b7a90;">{{ job.get('last_modified', '—') }}</td>
+            <td>
+              {% if pipeline_type == 'file_based' %}
+                <a class="btn btn-secondary" href="{{ url_for('edit_file_job', dag_id=job.dag_id) }}">Edit</a>
+                <form method="post" action="{{ url_for('delete_file_job', dag_id=job.dag_id) }}"
+                      style="display:inline"
+                      onsubmit="return confirm('Delete {{ job.dag_id }}?')">
+                  <button class="btn btn-danger">Delete</button>
+                </form>
+              {% elif pipeline_type == 'hybrid' %}
+                <a class="btn btn-secondary" href="{{ url_for('edit_hybrid_job', dag_id=job.dag_id) }}">Edit</a>
+                <form method="post" action="{{ url_for('delete_hybrid_job', dag_id=job.dag_id) }}"
+                      style="display:inline"
+                      onsubmit="return confirm('Delete {{ job.dag_id }}?')">
+                  <button class="btn btn-danger">Delete</button>
+                </form>
+              {% else %}
+                <a class="btn btn-secondary" href="{{ url_for('edit_job', dag_id=job.dag_id) }}">Edit</a>
+                <form method="post" action="{{ url_for('delete_job', dag_id=job.dag_id) }}"
+                      style="display:inline"
+                      onsubmit="return confirm('Delete {{ job.dag_id }}?')">
+                  <button class="btn btn-danger">Delete</button>
+                </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="7" style="text-align:center;color:#999;padding:24px;">
+              No jobs found.
+              {% if pipeline_type == 'hybrid' %}
+                <a href="{{ url_for('new_hybrid_job') }}">Add one.</a>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+</body>
+</html>

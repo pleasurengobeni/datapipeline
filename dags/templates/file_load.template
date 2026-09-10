@@ -1,0 +1,1321 @@
+import glob
+import hashlib
+import logging
+import os
+import re
+import shutil
+import sys
+import unicodedata
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote_plus
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.sensors.python import PythonSensor
+from airflow.utils.trigger_rule import TriggerRule
+
+modules_path = Variable.get(
+    "modules_path", default_var=os.path.join(os.getcwd(), "dags", "modules")
+)
+if modules_path not in sys.path:
+    sys.path.insert(1, modules_path)
+
+from modules.utils import read_json_file
+
+dag_name = "<dag_name>"
+
+# Every pipeline meta column any pipeline_type might write. A table can be
+# written to by any of them over its lifetime, so this list is used both to
+# strip stray meta columns from source data before hashing and to self-heal
+# the target table's schema before insert.
+_ALL_META_COLS = [
+    "_pipeline_inserted_at",
+    "_pipeline_run_id",
+    "_source_file",
+    "_file_checksum",
+    "_source_system",
+    "_loaded_at",
+    "_row_checksum",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_config(dag_name):
+    config_path = Variable.get(
+        "config_path", default_var=os.path.join(os.getcwd(), "dags", "config")
+    )
+    pattern = os.path.join(config_path, "**", f"*{dag_name.lower()}*.json")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        raise FileNotFoundError(
+            f"Config file for '{dag_name}' not found under '{config_path}'"
+        )
+    config = read_json_file(matches[0])
+    env = Variable.get("environment", "dev")
+
+    if "source" in config and env in config.get("source", {}):
+        source_cfg = config["source"][env]
+        target_cfg = config["target"][env]
+    else:
+        source_cfg = config["source"]
+        target_cfg = config["target"]
+
+    data_dump_base = Variable.get("data_dump", "/opt/airflow/data_dump")
+    watch_path   = source_cfg.get("watch_path") or os.path.join(data_dump_base, "incoming")
+    archive_path = source_cfg.get("archive_path") or os.path.join(data_dump_base, "archive")
+
+    # ── Permanent raw landing table — same schema convention as the hybrid
+    # pipeline: raw.<target_schema>_<target_table>_raw. Raw is never
+    # truncated, so it doubles as a durable record everything ever
+    # ingested can be rebuilt from without re-requesting the source file.
+    # No refined stage and no cleaning here — file_load stays a straight
+    # raw → target loader, just with a permanent checkpoint in between.
+    target_schema = target_cfg.get("target_schema") or target_cfg.get("target_table_schema")
+    target_table  = target_cfg.get("target_table")  or target_cfg.get("target_table_name")
+
+    return {
+        "dag_id":            config.get("dag_id", f"FILE_{dag_name}"),
+        "schedule_interval": config.get("schedule_interval"),
+        "start_date":        config.get("start_date", "2023-01-01"),
+        "source": {
+            # Stable shared drop folder — never changes
+            "watch_path":              watch_path,
+            # Exact filename to match in the drop folder
+            "file_name":               source_cfg.get("file_name") or source_cfg.get("file_pattern", ""),
+            # csv | parquet
+            "file_format":             source_cfg.get("file_format", "csv"),
+            # CSV-specific
+            "delimiter":               source_cfg.get("delimiter", ","),
+            "encoding":                source_cfg.get("encoding", "auto"),
+            "has_header":              source_cfg.get("has_header", True),
+            "null_values":             source_cfg.get("null_values", ["", "NULL", "null", "None", "NA", "N/A", "n/a", "#N/A"]),
+            "date_columns":            source_cfg.get("date_columns", []),
+            "dtype_overrides":         source_cfg.get("dtype_overrides", {}),
+            # Per-column date format hints (PostgreSQL-style, e.g. "DD/MM/YYYY").
+            # Used by _universal_to_datetime to resolve day-first/month-first
+            # ambiguity and handle non-ISO formats from CSVs.
+            "dtype_override_formats":  source_cfg.get("dtype_override_formats", {}),
+            "skip_rows":               source_cfg.get("skip_rows", 0),
+            # Archive config
+            "archive_path":            archive_path,
+            "archive_retention_days":  int(source_cfg.get("archive_retention_days", 30)),
+        },
+        "target": {
+            "target_db_conn_id": target_cfg.get("target_db_conn_id"),
+            "db_type":           target_cfg.get("db_type", "postgresql"),
+            "target_schema":     target_schema,
+            "target_table":      target_table,
+        },
+        "raw": {
+            "schema": "raw",
+            "table":  f"{target_schema}_{target_table}_raw",
+        },
+        "transformations":   config.get("transformations", []),
+        "rename_columns":    config.get("rename_columns", []),
+        "tags":              config.get("tags", ["ETL", "FILE", "file-etl"]),
+        "source_type":       "file",
+    }
+
+
+CONFIG = load_config(dag_name)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File cleaning helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_file(watch_path: str, file_name: str):  # -> Optional[str]
+    """Return the full path if file_name exists in watch_path, otherwise None."""
+    if not os.path.isdir(watch_path):
+        return None
+    fpath = os.path.join(watch_path, file_name)
+    return fpath if os.path.isfile(fpath) else None
+
+
+def _compute_md5(file_path: str) -> str:
+    """Return MD5 hex digest of the file at file_path."""
+    h = hashlib.md5()
+    with open(file_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _clean_col(name: str) -> str:
+    """Normalise a column name: strip accents, lower, replace non-alphanum with _."""
+    # NFD decompose → strip combining marks (accents etc.)
+    name = unicodedata.normalize("NFD", str(name))
+    name = "".join(c for c in name if unicodedata.category(c) != "Mn")
+    # lower + replace anything that isn't a-z 0-9 with _
+    name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    # protect SQL reserved words
+    reserved = {"from", "select", "where", "group", "order", "having",
+                "user", "table", "index", "start", "end", "begin", "if"}
+    if name in reserved:
+        name = name + "_"
+    return name or "col"
+
+
+def _detect_encoding(path: str) -> str:
+    """Read a sample of the file and detect its character encoding."""
+    try:
+        import chardet
+        with open(path, "rb") as fh:
+            sample = fh.read(65536)
+        result = chardet.detect(sample)
+        enc = result.get("encoding") or "utf-8"
+        # Normalise common aliases
+        enc = enc.upper().replace("-", "")
+        aliases = {"ASCII": "utf-8", "UTF8": "utf-8", "UTF8BOM": "utf-8-sig",
+                   "UTF16": "utf-16", "LATIN1": "latin-1", "ISO88591": "latin-1"}
+        return aliases.get(enc, result.get("encoding", "utf-8"))
+    except Exception:
+        return "utf-8"
+
+
+def _universal_to_datetime(series: "pd.Series", hint_fmt: str = None) -> "pd.Series":
+    """Parse ANY date/datetime series to datetime — DB native timestamps, ISO
+    text, non-ISO text (DD/MM/YYYY, MM/DD/YYYY), epoch integers (seconds or
+    milliseconds), CSV strings, named months, or mixed formats.
+
+    hint_fmt (optional PostgreSQL-style format string, e.g. 'DD/MM/YYYY'):
+        Used only to resolve DD-first vs MM-first ambiguity.  Everything else
+        — time components, sub-seconds, vendor-specific text — is auto-detected.
+
+    RAISES ValueError immediately if any non-null value cannot be parsed, with
+    the offending values listed, so the Airflow task fails with an actionable
+    message rather than silently writing NaT/NULL to the target table.
+    """
+    import pandas as pd
+
+    # 1. Already native datetime — nothing to do
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+
+    # 2. Determine day-first from hint
+    upper = (hint_fmt or "").upper().strip()
+    dayfirst = upper.startswith("DD")
+
+    # 3. Numeric dtype (int / float) — treat directly as epoch (seconds or ms).
+    #    Must happen BEFORE the pandas text parser because pandas interprets bare
+    #    integers as nanosecond offsets from 1970, producing wrong dates.
+    if pd.api.types.is_integer_dtype(series) or pd.api.types.is_float_dtype(series):
+        unit = "ms" if (series.abs() > 2e10).any() else "s"
+        parsed = pd.to_datetime(series, unit=unit, errors="coerce")
+        failed_mask = parsed.isna() & series.notna()
+        if failed_mask.any():
+            bad = series[failed_mask].dropna().unique()[:10]
+            raise ValueError(
+                f"[file_load] Cannot parse {failed_mask.sum()} value(s) in column "
+                f"'{series.name}' as epoch timestamp. Bad values: {list(bad)}. "
+                "Check source data or add an explicit format hint in dtype_override_formats."
+            )
+        return parsed
+
+    # 4. pandas mixed-format parser (handles ISO+ms/us, most text formats)
+    parsed = pd.to_datetime(series, dayfirst=dayfirst, infer_datetime_format=True, errors="coerce")
+
+    # 5. Epoch integers stored as strings (e.g. CSV column "1704067200")
+    failed_mask = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+    if failed_mask.any():
+        try:
+            numeric = pd.to_numeric(series[failed_mask], errors="raise")
+            unit = "ms" if (numeric.abs() > 2e10).any() else "s"
+            parsed = parsed.copy()
+            parsed.loc[failed_mask] = pd.to_datetime(numeric, unit=unit, errors="coerce")
+            failed_mask = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+        except (ValueError, TypeError):
+            pass
+
+    # 6. dateutil fallback for named months, vendor formats, non-standard patterns
+    if failed_mask.any():
+        from dateutil import parser as _du
+        def _try_du(v):
+            try:
+                return _du.parse(str(v), dayfirst=dayfirst)
+            except Exception:
+                return pd.NaT
+        parsed = parsed.copy()
+        parsed.loc[failed_mask] = series[failed_mask].apply(_try_du)
+        failed_mask = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+
+    # 7. Fail loudly — list the bad values so the user knows exactly what to fix
+    if failed_mask.any():
+        bad = series[failed_mask].dropna().unique()[:10]
+        raise ValueError(
+            f"[file_load] Cannot parse {failed_mask.sum()} value(s) in column "
+            f"'{series.name}' as date/timestamp. Bad values: {list(bad)}. "
+            "Check the source data or add an explicit format hint in dtype_override_formats."
+        )
+    return parsed
+
+
+def _read_file(cfg: dict, file_path: str) -> "pd.DataFrame":
+    """Read CSV or Parquet into a clean DataFrame with robust handling."""
+    import numpy as np
+    import pandas as pd
+
+    file_format = cfg["file_format"].lower()
+    null_vals   = cfg["null_values"]
+
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Source file not found: {file_path}")
+
+    # ── Parquet (no encoding / ASCII issues) ──────────────────────────────
+    if file_format == "parquet":
+        df = pd.read_parquet(file_path)
+        df.columns = [_clean_col(c) for c in df.columns]
+        return df
+
+    # ── CSV ───────────────────────────────────────────────────────────────
+    encoding_cfg = cfg.get("encoding", "auto")
+    encoding = _detect_encoding(file_path) if encoding_cfg == "auto" else encoding_cfg
+
+    delimiter = cfg.get("delimiter", ",")
+    has_header = cfg.get("has_header", True)
+    skip_rows  = cfg.get("skip_rows", 0)
+
+    logging.info(f"[file_load] Reading CSV: {file_path} | enc={encoding} | sep={repr(delimiter)}")
+
+    read_kwargs = dict(
+        filepath_or_buffer=file_path,
+        sep=delimiter,
+        header=0 if has_header else None,
+        skiprows=skip_rows if skip_rows else None,
+        encoding=encoding,
+        encoding_errors="replace",
+        na_values=null_vals,
+        keep_default_na=True,
+        low_memory=False,
+        dtype=str,
+    )
+
+    try:
+        df = pd.read_csv(**read_kwargs)
+    except UnicodeDecodeError:
+        logging.warning("[file_load] Encoding fallback to latin-1")
+        read_kwargs["encoding"] = "latin-1"
+        df = pd.read_csv(**read_kwargs)
+
+    # ── Clean column names ────────────────────────────────────────────────
+    df.columns = [_clean_col(c) for c in df.columns]
+
+    # ── Strip whitespace from all string cells ────────────────────────────
+    str_cols = df.select_dtypes(include="object").columns
+    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
+
+    # ── Re-apply null sentinel values after strip ─────────────────────────
+    null_set = {str(v).strip().lower() for v in null_vals}
+    for col in str_cols:
+        df[col] = df[col].where(~df[col].str.lower().isin(null_set), other=np.nan)
+
+    # ── Remove non-printable / non-ASCII control characters ──────────────
+    ctrl_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+    for col in str_cols:
+        df[col] = df[col].apply(
+            lambda x: ctrl_re.sub("", x) if isinstance(x, str) else x
+        )
+
+    return df
+
+
+def _cast_types(df: "pd.DataFrame", cfg: dict) -> "pd.DataFrame":
+    """Apply dtype_overrides and infer numeric/date types safely.
+
+    dtype_overrides: {col: dtype_string} — explicit type per column.
+    dtype_override_formats: {col: pg_format_string} — day/month hint for
+        date/timestamp columns with non-ISO formats (e.g. 'DD/MM/YYYY').
+        Follows the same PostgreSQL-style format strings as the DB pipeline.
+
+    Date/timestamp columns run through _universal_to_datetime which handles
+    any format and RAISES ValueError (fail-loud) if values cannot be parsed —
+    no silent NaT/NULL in the target table.
+
+    date_columns: legacy list of column names to cast as datetime. If a column
+    also appears in dtype_overrides it is handled there; date_columns covers
+    columns that only need datetime casting without a full override entry.
+    """
+    import pandas as pd
+
+    date_cols        = cfg.get("date_columns", [])
+    dtype_overrides  = cfg.get("dtype_overrides", {})
+    fmt_hints        = cfg.get("dtype_override_formats", {})
+
+    # ── Apply explicit overrides ──────────────────────────────────────────
+    for raw_col, dtype in dtype_overrides.items():
+        col = _clean_col(raw_col)
+        if col not in df.columns:
+            continue
+        try:
+            d = dtype.lower()
+            if d in ("int", "int64", "integer", "bigint"):
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            elif d in ("float", "float64", "numeric", "decimal"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            elif d in ("bool", "boolean"):
+                df[col] = df[col].map(
+                    {"true": True, "false": False, "1": True, "0": False,
+                     "yes": True, "no": False, "y": True, "n": False}
+                )
+            elif d in ("date", "timestamp", "datetime"):
+                hint = fmt_hints.get(raw_col) or fmt_hints.get(col)
+                df[col] = _universal_to_datetime(df[col], hint_fmt=hint)
+            else:
+                df[col] = df[col].astype(str)
+        except ValueError:
+            raise  # date parse failures must bubble up — task should fail loudly
+        except Exception as exc:
+            logging.warning("[file_load] dtype override failed for '%s' → %s: %s", col, dtype, exc)
+
+    # ── Explicit date_columns (legacy, no type hint available) ───────────
+    already_typed = {_clean_col(c) for c in dtype_overrides}
+    for raw_col in date_cols:
+        col = _clean_col(raw_col)
+        if col in df.columns and col not in already_typed:
+            hint = fmt_hints.get(raw_col) or fmt_hints.get(col)
+            df[col] = _universal_to_datetime(df[col], hint_fmt=hint)
+
+    # ── Auto-infer numerics for remaining object columns ──────────────────
+    date_col_set = {_clean_col(c) for c in date_cols}
+    for col in df.select_dtypes(include="object").columns:
+        if col in already_typed or col in date_col_set:
+            continue
+        numeric = pd.to_numeric(df[col], errors="coerce")
+        # Only promote if ≥ 80 % of non-null values parsed successfully
+        non_null = df[col].notna().sum()
+        parsed   = numeric.notna().sum()
+        if non_null > 0 and parsed / non_null >= 0.8:
+            df[col] = numeric
+
+    return df
+
+
+def _apply_transformations(df: "pd.DataFrame", cfg: dict) -> "pd.DataFrame":
+    """Rename columns and apply value replace_values from config."""
+    rename_map = {}
+    for entry in cfg.get("rename_columns", []):
+        for old, new in entry.items():
+            rename_map[_clean_col(old)] = _clean_col(new)
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    # transformations list: [{col: new_type}, ...]  — already handled in _cast_types
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Target helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ENGINE_CACHE = None
+
+
+def _get_target_engine():
+    global _ENGINE_CACHE
+    if _ENGINE_CACHE is not None:
+        return _ENGINE_CACHE
+
+    from airflow.hooks.base import BaseHook
+    from sqlalchemy import create_engine
+
+    conn_id  = CONFIG["target"]["target_db_conn_id"]
+    conn     = BaseHook.get_connection(conn_id)
+    db_type  = CONFIG["target"].get("db_type", "postgresql")
+
+    port = conn.port or 5432
+    pwd  = quote_plus(str(conn.password or ""))
+    if db_type == "mysql":
+        url = f"mysql+pymysql://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}"
+    elif db_type in ("mssql", "sqlserver"):
+        url = f"mssql+pyodbc://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}?driver=ODBC+Driver+17+for+SQL+Server"
+    else:
+        url = f"postgresql+psycopg2://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}"
+
+    _ENGINE_CACHE = create_engine(url, pool_pre_ping=True)
+    return _ENGINE_CACHE
+
+
+def _pg_copy_df(df, schema, table, engine):
+    """Bulk-load a DataFrame into a PostgreSQL table using COPY FROM STDIN.
+
+    5–20× faster than to_sql(method='multi') for large DataFrames.
+    Only called when db_type == 'postgresql'.
+    """
+    import io
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, na_rep="")
+    buf.seek(0)
+    col_sql = ", ".join(f'"{c}"' for c in df.columns)
+    raw = engine.raw_connection()
+    try:
+        cur = raw.cursor()
+        cur.copy_expert(
+            f'COPY "{schema}"."{table}" ({col_sql}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE)',
+            buf,
+        )
+        cur.close()
+        raw.commit()
+    finally:
+        raw.close()
+
+
+def _ensure_table_from_df(df, schema, table):
+    """Create the raw landing table (all TEXT columns) if it doesn't exist
+    yet, or add any columns present in df but missing from the table
+    (handles schema evolution between runs)."""
+    from sqlalchemy import text
+    engine = _get_target_engine()
+    col_defs = ", ".join(f'"{c}" TEXT' for c in df.columns)
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({col_defs})'))
+        for col in df.columns:
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{table}" ADD COLUMN IF NOT EXISTS "{col}" TEXT'
+            ))
+
+
+def _checksum_already_registered(schema: str, table: str, checksum: str) -> bool:
+    """Return True if this MD5 checksum is already in pipeline.file_load_registry for this target.
+
+    Ensures the registry table exists first (idempotent) so the lookup never
+    relies on exception handling — which is slow and aborts the transaction.
+    """
+    from sqlalchemy import text
+    engine = _get_target_engine()
+    with engine.begin() as conn:
+        _ensure_registry_table(conn)
+    with engine.connect() as conn:
+        r = conn.execute(
+            text("""
+                SELECT 1 FROM pipeline.file_load_registry
+                WHERE target_schema = :s AND target_table = :t AND file_checksum = :c
+                LIMIT 1
+            """),
+            {"s": schema, "t": table, "c": checksum},
+        )
+        return r.fetchone() is not None
+
+
+def _ensure_registry_table(conn):
+    """Create pipeline.file_load_registry if it doesn't exist."""
+    from sqlalchemy import text
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS pipeline.file_load_registry (
+            id              SERIAL PRIMARY KEY,
+            dag_id          TEXT,
+            target_schema   TEXT,
+            target_table    TEXT,
+            file_name       TEXT,
+            file_path       TEXT,
+            file_checksum   TEXT,
+            file_size_bytes BIGINT,
+            rows_loaded     BIGINT,
+            run_id          TEXT,
+            loaded_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            archived_to     TEXT,
+            archived_at     TIMESTAMP WITH TIME ZONE
+        )
+    """))
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_file_registry_checksum
+            ON pipeline.file_load_registry (target_schema, target_table, file_checksum)
+    """))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tasks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sense_file_fn(**ctx) -> bool:
+    """
+    PythonSensor poke: check watch_path for the exact file_name.
+    Pushes matched file path to XCom so downstream tasks can use it.
+    Returns True (sensor success) when the file is found.
+    """
+    src         = CONFIG["source"]
+    watch_path  = src["watch_path"]
+    file_name   = src["file_name"]
+
+    matched = _find_file(watch_path, file_name)
+    if matched:
+        ctx["ti"].xcom_push(key="matched_file", value=matched)
+        logging.info(f"[sense_file] Found: {matched}")
+        return True
+
+    logging.info(f"[sense_file] '{file_name}' not yet in '{watch_path}' — will retry.")
+    return False
+
+
+def compute_checksum(**ctx):
+    """Compute MD5 of the matched file and push to XCom."""
+    file_path = ctx["ti"].xcom_pull(task_ids="sense_file", key="matched_file")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"[compute_checksum] File not found: {file_path}")
+
+    checksum = _compute_md5(file_path)
+    file_size = os.path.getsize(file_path)
+    logging.info(f"[compute_checksum] {file_path} | MD5={checksum} | size={file_size}")
+    ctx["ti"].xcom_push(key="checksum",  value=checksum)
+    ctx["ti"].xcom_push(key="file_size", value=file_size)
+
+
+def check_registry(**ctx):
+    """Branch: skip if checksum already registered, otherwise ingest into raw.
+
+    Keyed on raw's schema/table (not target's) — raw is the durable
+    ingest checkpoint now, so "have I already loaded this file" means
+    "is it already in raw," matching the hybrid pipeline's convention.
+    """
+    raw      = CONFIG["raw"]
+    checksum = ctx["ti"].xcom_pull(task_ids="compute_checksum", key="checksum")
+
+    if _checksum_already_registered(raw["schema"], raw["table"], checksum):
+        logging.info(f"[check_registry] Checksum {checksum} already loaded — skipping.")
+        return "already_loaded"
+    return "load_to_raw"
+
+
+def load_to_raw(**ctx):
+    """Read the file and append it as-is (TEXT-only, no casts/transforms)
+    into the permanent raw table. Raw is never truncated — it accumulates
+    as a durable record of everything ever ingested, so target can always
+    be rebuilt from it without re-requesting the original file.
+    """
+    from sqlalchemy import text
+
+    ti     = ctx["ti"]
+    src    = CONFIG["source"]
+    raw    = CONFIG["raw"]
+    run_id = ctx.get("run_id", ctx["dag_run"].run_id)
+
+    file_path = ti.xcom_pull(task_ids="sense_file", key="matched_file")
+    checksum  = ti.xcom_pull(task_ids="compute_checksum", key="checksum")
+    file_name = Path(file_path).name
+
+    df = _read_file(src, file_path)
+    logging.info(f"[load_to_raw] Read {len(df)} rows, {len(df.columns)} columns from '{file_name}'")
+
+    # Raw is a landing zone — no type coercion, no transformations. Those
+    # are applied downstream in load_to_target so raw always reflects
+    # exactly what was ingested.
+    now = datetime.utcnow()
+    df = df.drop(columns=[c for c in _ALL_META_COLS if c in df.columns])
+    data_cols = list(df.columns)
+    df["_row_checksum"] = (
+        df[data_cols].astype(str)
+        .apply(lambda r: hashlib.md5("|".join(r).encode("utf-8")).hexdigest(), axis=1)
+    )
+    df.insert(0, "_pipeline_inserted_at", now)
+    df.insert(1, "_pipeline_run_id",      run_id)
+    df.insert(2, "_source_file",          file_name)
+    df.insert(3, "_file_checksum",        checksum)
+    df.insert(4, "_loaded_at",            now)
+
+    engine = _get_target_engine()
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{raw["schema"]}"'))
+        conn.execute(text('CREATE SCHEMA IF NOT EXISTS "etl_stg"'))
+    _ensure_table_from_df(df, raw["schema"], raw["table"])
+
+    # Row-level dedup matched on data + provenance (_row_checksum AND
+    # _file_checksum), not data alone — the same row appearing again in a
+    # genuinely different file is a real, distinct ingest event worth
+    # keeping in this permanent record, not something to silently drop.
+    # Data-only dedup belongs downstream at the target instead.
+    tmp = f"_tmp_raw_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+    df.head(0).to_sql(tmp, schema="etl_stg", con=engine, if_exists="replace", index=False)
+    _pg_copy_df(df, "etl_stg", tmp, engine)
+
+    cols = ", ".join(f'"{c}"' for c in df.columns)
+    with engine.begin() as conn:
+        result = conn.execute(text(f"""
+            INSERT INTO "{raw["schema"]}"."{raw["table"]}" ({cols})
+            SELECT {cols} FROM "etl_stg"."{tmp}" t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{raw["schema"]}"."{raw["table"]}" r
+                WHERE r._row_checksum = t._row_checksum
+                  AND r._file_checksum IS NOT DISTINCT FROM t._file_checksum
+            )
+        """))
+        rows = result.rowcount
+        conn.execute(text(f'DROP TABLE IF EXISTS "etl_stg"."{tmp}"'))
+
+    logging.info("[load_to_raw] %d/%d rows were new (%d duplicate rows skipped) → %s.%s",
+                 rows, len(df), len(df) - rows, raw["schema"], raw["table"])
+    ti.xcom_push(key="rows_loaded", value=rows)
+    ti.xcom_push(key="file_name",   value=file_name)
+
+
+def load_to_target(**ctx):
+    """Read this run's scoped batch from raw (or all of raw, on reload),
+    cast/transform/checksum it, and dedup-merge it into the target table.
+    """
+    import numpy as np
+    import pandas as pd
+    from sqlalchemy import text
+
+    ti       = ctx["ti"]
+    src      = CONFIG["source"]
+    tgt      = CONFIG["target"]
+    raw      = CONFIG["raw"]
+    schema   = tgt["target_schema"]
+    table    = tgt["target_table"]
+    run_id   = ctx.get("run_id", ctx["dag_run"].run_id)
+    reload   = bool((ctx["dag_run"].conf or {}).get("reload"))
+
+    # ── Read the scoped batch from raw ──────────────────────────────────
+    engine = _get_target_engine()
+    scope_sql = f'SELECT * FROM "{raw["schema"]}"."{raw["table"]}"'
+    params = {}
+    if not reload:
+        scope_sql += ' WHERE "_pipeline_run_id" = :run_id'
+        params = {"run_id": run_id}
+    with engine.connect() as conn:
+        df = pd.read_sql(text(scope_sql), conn, params=params)
+
+    if df.empty:
+        logging.info("[load_to_target] No rows in scope (reload=%s).", reload)
+        ti.xcom_push(key="rows_loaded", value=0)
+        ti.xcom_push(key="file_name",   value=None)
+        return
+
+    logging.info("[load_to_target] %d rows in scope from raw (reload=%s)", len(df), reload)
+
+    # Preserve each row's real provenance instead of blanking it — matters
+    # especially on reload, where rows from several different original
+    # files can be in scope together at once.
+    source_files    = df["_source_file"].values
+    file_checksums  = df["_file_checksum"].values
+
+    df = df.drop(columns=[c for c in _ALL_META_COLS if c in df.columns])
+
+    # ── Apply type casts ──────────────────────────────────────────────────
+    df = _cast_types(df, src)
+
+    # ── Apply rename / transformations ────────────────────────────────────
+    df = _apply_transformations(df, CONFIG)
+
+    # ── Pipeline metadata columns ─────────────────────────────────────────
+    now = datetime.utcnow()
+
+    # Row-level checksum computed on TYPED values — must match the
+    # pre-permanent-raw semantics exactly (this was always computed
+    # post-cast, never off raw's TEXT values) or dedup against rows
+    # already in target from before this change ships would silently break.
+    data_cols = list(df.columns)
+    df["_row_checksum"] = (
+        df[data_cols]
+        .astype(str)
+        .apply(lambda r: hashlib.md5("|".join(r).encode("utf-8")).hexdigest(), axis=1)
+    )
+
+    df.insert(0, "_pipeline_inserted_at", now)
+    df.insert(1, "_pipeline_run_id",      run_id)
+    df.insert(2, "_source_file",          source_files)
+    df.insert(3, "_file_checksum",        file_checksums)
+    df.insert(4, "_loaded_at",            now)
+
+    # ── Ensure schema + target table exist, then upsert ────────────────────
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS etl_stg"))
+
+    # ── Reconcile metadata columns on pre-existing tables ────────────────
+    # A table can be written to by any pipeline_type over its lifetime, so
+    # every meta column any template might need must exist regardless of
+    # which one created the table. If this table was previously loaded by
+    # the DB pipeline it will have _source_system but lack _source_file /
+    # _file_checksum.  A plain INSERT would fail with "column does not
+    # exist".  We ADD whatever's missing; existing columns/data are untouched.
+    _FILE_META_COLS = [
+        ("_pipeline_inserted_at", "TIMESTAMP"),
+        ("_pipeline_run_id",      "TEXT"),
+        ("_source_system",        "TEXT"),
+        ("_source_file",          "TEXT"),
+        ("_file_checksum",        "TEXT"),
+        ("_loaded_at",            "TIMESTAMP"),
+        ("_row_checksum",         "TEXT"),
+    ]
+    with engine.begin() as conn:
+        exists = conn.execute(text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = :s AND table_name = :t"
+        ), {"s": schema, "t": table}).scalar()
+        if exists:
+            for col, col_type in _FILE_META_COLS:
+                col_exists = conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_schema=:s AND table_name=:t AND column_name=:c"
+                ), {"s": schema, "t": table, "c": col}).scalar()
+                if not col_exists:
+                    conn.execute(text(
+                        f'ALTER TABLE "{schema}"."{table}" ADD COLUMN "{col}" {col_type}'
+                    ))
+                    logging.info("[load_to_target] Added missing column %s.%s.%s (%s)", schema, table, col, col_type)
+            # _source_system is a DB-pipeline column not written by file pipeline;
+            # leave it in place (existing rows keep their value) but fill NULLs
+            # on new rows via the INSERT — no structural change needed.
+
+    # Write to a staging temp table in etl_stg, then insert only rows whose
+    # _row_checksum is not already present in the target — prevents duplicates
+    # when the same data rows appear in a subsequent file with a different checksum.
+    tmp_table   = f"_tmp_{table}_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+    stg_schema  = "etl_stg"
+    _is_pg      = CONFIG["target"].get("db_type", "postgresql") == "postgresql"
+    _load_start = datetime.utcnow()
+    logging.info("[load_to_target] Writing %d rows to staging table → %s.%s", len(df), stg_schema, tmp_table)
+
+    if _is_pg:
+        # Create empty table with correct schema, then COPY data — 5–20× faster
+        df.head(0).to_sql(
+            name=tmp_table,
+            schema=stg_schema,
+            con=engine,
+            if_exists="replace",
+            index=False,
+        )
+        _pg_copy_df(df, stg_schema, tmp_table, engine)
+    else:
+        df.to_sql(
+            name=tmp_table,
+            schema=stg_schema,
+            con=engine,
+            if_exists="replace",
+            index=False,
+            method="multi",
+            chunksize=5000,
+        )
+    logging.info("[load_to_target] Staging table loaded in %.1fs", (datetime.utcnow() - _load_start).total_seconds())
+
+    cols = ", ".join(f'"{c}"' for c in df.columns)
+    # Auto-create the main table from the staging table structure if it doesn't exist yet
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS "{schema}"."{table}" AS
+            SELECT {cols} FROM "{stg_schema}"."{tmp_table}" WHERE 1=0
+        """))
+
+    with engine.begin() as conn:
+        result = conn.execute(text(f"""
+            INSERT INTO "{schema}"."{table}" ({cols})
+            SELECT {cols} FROM "{stg_schema}"."{tmp_table}" t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{schema}"."{table}" r
+                WHERE r._row_checksum = t._row_checksum
+            )
+        """))
+        rows_loaded = result.rowcount
+        # Drop staging table only after successful INSERT
+        conn.execute(text(f'DROP TABLE IF EXISTS "{stg_schema}"."{tmp_table}"'))
+        logging.info("[load_to_target] Staging table %s.%s dropped.", stg_schema, tmp_table)
+
+    elapsed_total = (datetime.utcnow() - _load_start).total_seconds()
+    rows_skipped  = len(df) - rows_loaded
+    if rows_skipped:
+        logging.info("[load_to_target] Skipped %d duplicate rows (already in %s.%s)", rows_skipped, schema, table)
+    logging.info(
+        "[load_to_target] Inserted %d new rows → %s.%s in %.1fs (%.0f rows/s)",
+        rows_loaded, schema, table, elapsed_total,
+        rows_loaded / elapsed_total if elapsed_total > 0 else 0,
+    )
+    ti.xcom_push(key="rows_loaded", value=rows_loaded)
+    # Single representative file name for metrics/registry purposes — exact
+    # when this run's scope came from one file (the normal case), a summary
+    # when reload pulled rows from several different original files at once.
+    unique_files = sorted(set(f for f in source_files if f))
+    if len(unique_files) == 1:
+        ti.xcom_push(key="file_name", value=unique_files[0])
+    elif unique_files:
+        ti.xcom_push(key="file_name", value=f"{len(unique_files)} files (reload)")
+    else:
+        ti.xcom_push(key="file_name", value=None)
+
+
+def discard_duplicate_file(**ctx):
+    """Same-checksum file detected — already loaded previously.
+    Delete it from incoming/ so sense_file stops re-triggering on it.
+    """
+    ti        = ctx["ti"]
+    file_path = ti.xcom_pull(task_ids="sense_file", key="matched_file")
+
+    if not file_path or not os.path.exists(file_path):
+        logging.info("[discard_duplicate] File not on disk — nothing to do.")
+        return
+
+    os.remove(file_path)
+    logging.info(f"[discard_duplicate] Duplicate file deleted: {file_path}")
+
+
+def archive_file(**ctx):
+    """Copy the loaded file to the archive folder (timestamped), then delete the original.
+
+    Uses copy2 + os.remove instead of shutil.move so it works safely across
+    different Docker volume mounts / filesystems where rename(2) would fail.
+    """
+    ti        = ctx["ti"]
+    src       = CONFIG["source"]
+    file_path = ti.xcom_pull(task_ids="sense_file", key="matched_file")
+
+    logging.info("[archive_file] source file XCom value: %r", file_path)
+
+    if not file_path:
+        logging.warning("[archive_file] No file path in XCom — nothing to archive.")
+        ti.xcom_push(key="archived_to", value=None)
+        return
+
+    if not os.path.exists(file_path):
+        logging.warning("[archive_file] Source file does not exist on disk: %s", file_path)
+        ti.xcom_push(key="archived_to", value=None)
+        return
+
+    archive_dir = src["archive_path"]
+    logging.info("[archive_file] archive_dir resolved to: %r", archive_dir)
+
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+        logging.info("[archive_file] archive_dir ensured: %s", archive_dir)
+    except OSError as exc:
+        logging.error("[archive_file] Cannot create archive dir %s: %s", archive_dir, exc)
+        raise
+
+    p         = Path(file_path)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    new_name  = f"{p.stem}_{timestamp}{p.suffix}"
+    dest      = os.path.join(archive_dir, new_name)
+
+    logging.info("[archive_file] Copying '%s' → '%s'", file_path, dest)
+    try:
+        shutil.copy2(file_path, dest)
+        # Reset mtime to now so cleanup_archive retention check is based on
+        # when the file was archived, not the original file's mtime.
+        os.utime(dest, None)
+    except Exception as exc:
+        logging.error("[archive_file] copy2 failed: %s", exc)
+        raise
+
+    # Verify the copy landed correctly before deleting the source
+    if not os.path.exists(dest):
+        raise FileNotFoundError(
+            f"[archive_file] Copy appeared to succeed but dest not found: {dest}"
+        )
+    if os.path.getsize(dest) != os.path.getsize(file_path):
+        raise ValueError(
+            f"[archive_file] Size mismatch after copy: "
+            f"src={os.path.getsize(file_path)} dest={os.path.getsize(dest)}"
+        )
+
+    try:
+        os.remove(file_path)
+        logging.info("[archive_file] Deleted original: %s", file_path)
+    except OSError as exc:
+        logging.warning(
+            "[archive_file] Could not delete original file %s (archive copy is safe): %s",
+            file_path, exc
+        )
+        # Don't re-raise — archive copy succeeded, original deletion is best-effort
+
+    logging.info("[archive_file] ✅ Archived '%s' → '%s'", file_path, dest)
+    ti.xcom_push(key="archived_to", value=dest)
+
+
+def cleanup_archive(**ctx):
+    """Delete archive files older than archive_retention_days."""
+    src              = CONFIG["source"]
+    archive_dir      = src["archive_path"]
+    retention_days   = src["archive_retention_days"]
+    cutoff           = datetime.utcnow().timestamp() - retention_days * 86400
+
+    if not os.path.isdir(archive_dir):
+        return
+
+    deleted = 0
+    for fname in os.listdir(archive_dir):
+        fpath = os.path.join(archive_dir, fname)
+        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+            os.remove(fpath)
+            deleted += 1
+            logging.info(f"[cleanup_archive] Deleted old archive file: {fpath}")
+
+    logging.info(f"[cleanup_archive] Removed {deleted} files older than {retention_days} days.")
+
+
+def collect_metrics_fn(**ctx):
+    """Write run metrics to pipeline.etl_metrics and registry to pipeline.file_load_registry."""
+    from sqlalchemy import create_engine, text
+    from airflow.hooks.base import BaseHook
+
+    ti          = ctx["ti"]
+    dag_run     = ctx["dag_run"]
+    _now        = datetime.utcnow()
+    # Use dag_run.start_date — actual scheduler execution start, not logical interval start
+    _start_raw  = dag_run.start_date if dag_run and dag_run.start_date else _now
+    run_start   = _start_raw.replace(tzinfo=None) if hasattr(_start_raw, 'tzinfo') and _start_raw.tzinfo else _start_raw
+    run_end     = _now
+    duration    = int((run_end - run_start).total_seconds())
+    rows_loaded = ti.xcom_pull(task_ids="load_to_target", key="rows_loaded") or 0
+    file_name   = ti.xcom_pull(task_ids="load_to_target", key="file_name")   or ""
+    checksum    = ti.xcom_pull(task_ids="compute_checksum", key="checksum")   or ""
+    file_size   = ti.xcom_pull(task_ids="compute_checksum", key="file_size")  or 0
+    file_path   = ti.xcom_pull(task_ids="sense_file",       key="matched_file") or ""
+    archived_to = ti.xcom_pull(task_ids="archive_file",     key="archived_to")
+
+    conn_id = CONFIG["target"]["target_db_conn_id"]
+    conn    = BaseHook.get_connection(conn_id)
+    port    = conn.port or 5432
+    pwd     = quote_plus(str(conn.password or ""))
+    url     = f"postgresql+psycopg2://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}"
+    engine  = create_engine(url, pool_pre_ping=True)
+
+    schema = CONFIG["target"]["target_schema"]
+    table  = CONFIG["target"]["target_table"]
+    env    = Variable.get("environment", "dev")
+    run_id = ctx["run_id"]
+
+    with engine.begin() as conn:
+        # ── Ensure etl_metrics table ──────────────────────────────────────
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id                          SERIAL PRIMARY KEY,
+                dag_id                      TEXT,
+                env                         TEXT,
+                schema                      TEXT,
+                table_name                  TEXT,
+                run_id                      TEXT,
+                run_start                   TIMESTAMP WITH TIME ZONE,
+                run_end                     TIMESTAMP WITH TIME ZONE,
+                run_duration_secs           INTEGER,
+                run_status                  TEXT NOT NULL DEFAULT 'success',
+                error_msg                   TEXT,
+                batch_size                  INTEGER,
+                rows_loaded_now             BIGINT,
+                target_total_records        BIGINT,
+                target_today_records        BIGINT,
+                target_max_upload_date      TIMESTAMP,
+                target_first_upload_date    TIMESTAMP,
+                target_max_incremental      TEXT,
+                source_total_records        BIGINT,
+                source_max_incremental      TEXT,
+                source_loaded_to_max_target BIGINT,
+                perc_loaded                 NUMERIC(6,2),
+                created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type                 TEXT DEFAULT 'pandas',
+                source_type                 TEXT DEFAULT 'db'
+            )
+        """))
+        for m in [
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'db'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_today_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_first_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_total_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_loaded_to_max_target BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS perc_loaded NUMERIC(6,2)",
+        ]:
+            conn.execute(text(m))
+
+        # Counts plus load-recency from the target's own _loaded_at meta
+        # column, which every row is stamped with at load time. A file job
+        # has no incremental_column to key a "today" figure off, but "when
+        # did this pipeline write the row" is always known — without this
+        # the freshness columns sit NULL and the dashboard reports 0 rows
+        # loaded today for a table that in fact loaded thousands.
+        target_today = target_max_upload = target_first_upload = None
+        try:
+            conn.execute(text("SAVEPOINT count_check"))
+            r = conn.execute(text(f"""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE "_loaded_at" >= date_trunc('day', now())),
+                       MAX("_loaded_at"),
+                       MIN("_loaded_at")
+                FROM "{schema}"."{table}"
+            """)).fetchone()
+            target_total, target_today = r[0] or 0, r[1] or 0
+            target_max_upload, target_first_upload = r[2], r[3]
+            conn.execute(text("RELEASE SAVEPOINT count_check"))
+        except Exception:
+            # Target missing, or predating the pipeline meta columns.
+            conn.execute(text("ROLLBACK TO SAVEPOINT count_check"))
+            try:
+                conn.execute(text("SAVEPOINT count_check"))
+                target_total = conn.execute(
+                    text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
+                ).scalar() or 0
+                conn.execute(text("RELEASE SAVEPOINT count_check"))
+            except Exception:
+                conn.execute(text("ROLLBACK TO SAVEPOINT count_check"))
+                target_total = 0
+
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status,
+                batch_size, rows_loaded_now, target_total_records,
+                target_today_records, target_max_upload_date,
+                target_first_upload_date, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name, :run_id,
+                :run_start, :run_end, :duration, 'success',
+                0, :rows_loaded, :target_total,
+                :target_today, :target_max_upload,
+                :target_first_upload, 'pandas', 'file'
+            )
+        """), {
+            "dag_id":              CONFIG["dag_id"],
+            "env":                 env,
+            "schema":              schema,
+            "table_name":          table,
+            "run_id":              run_id,
+            "run_start":           run_start,
+            "run_end":             run_end,
+            "duration":            duration,
+            "rows_loaded":         rows_loaded,
+            "target_total":        target_total,
+            "target_today":        target_today,
+            "target_max_upload":   target_max_upload,
+            "target_first_upload": target_first_upload,
+        })
+
+        # ── Ensure file_load_registry and insert record ───────────────────
+        # Keyed on raw's schema/table (not target's) — raw is the durable
+        # ingest checkpoint, matching check_registry's scope above.
+        if not checksum:
+            # Reload runs bypass ingest entirely, so there's no new file/
+            # checksum to register. Without this guard every reload would
+            # insert a junk NULL-checksum row (Postgres treats each NULL as
+            # distinct under the unique constraint, so they wouldn't even
+            # dedupe against each other).
+            logging.info("[collect_metrics] No new file this run (reload) — skipping registry insert.")
+        else:
+            raw = CONFIG["raw"]
+            _ensure_registry_table(conn)
+            conn.execute(text("""
+                INSERT INTO pipeline.file_load_registry (
+                    dag_id, target_schema, target_table, file_name, file_path,
+                    file_checksum, file_size_bytes, rows_loaded, run_id,
+                    loaded_at, archived_to, archived_at
+                ) VALUES (
+                    :dag_id, :schema, :table, :file_name, :file_path,
+                    :checksum, :file_size, :rows_loaded, :run_id,
+                    NOW(), :archived_to, CASE WHEN :archived_to2 IS NOT NULL THEN NOW() ELSE NULL END
+                )
+                ON CONFLICT (target_schema, target_table, file_checksum) DO NOTHING
+            """), {
+                "dag_id":      CONFIG["dag_id"],
+                "schema":      raw["schema"],
+                "table":       raw["table"],
+                "file_name":   file_name,
+                "file_path":   file_path,
+                "checksum":    checksum,
+                "file_size":   file_size,
+                "rows_loaded": rows_loaded,
+                "run_id":      run_id,
+                "archived_to": archived_to,
+                "archived_to2": archived_to,
+            })
+
+    logging.info(
+        f"[collect_metrics] Metrics written — {rows_loaded} rows from '{file_name}' | checksum={checksum}"
+    )
+
+
+def collect_error_metrics_fn(**ctx):
+    """Write failure metrics to pipeline.etl_metrics."""
+    from sqlalchemy import create_engine, text
+    from airflow.hooks.base import BaseHook
+
+    dag_run     = ctx.get("dag_run")
+    _now        = datetime.utcnow()
+    # Use dag_run.start_date — actual scheduler execution start, not logical interval start
+    _start_raw  = dag_run.start_date if dag_run and dag_run.start_date else _now
+    run_start   = _start_raw.replace(tzinfo=None) if hasattr(_start_raw, 'tzinfo') and _start_raw.tzinfo else _start_raw
+    run_end     = _now
+    duration    = int((run_end - run_start).total_seconds())
+    error_msg = str(ctx.get("exception", "Unknown error"))[:2000]
+
+    conn_id = CONFIG["target"]["target_db_conn_id"]
+    conn    = BaseHook.get_connection(conn_id)
+    port    = conn.port or 5432
+    pwd     = quote_plus(str(conn.password or ""))
+    url     = f"postgresql+psycopg2://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}"
+    engine  = create_engine(url, pool_pre_ping=True)
+
+    env    = Variable.get("environment", "dev")
+    schema = CONFIG["target"]["target_schema"]
+    table  = CONFIG["target"]["target_table"]
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id SERIAL PRIMARY KEY, dag_id TEXT, env TEXT, schema TEXT,
+                table_name TEXT, run_id TEXT, run_start TIMESTAMP WITH TIME ZONE,
+                run_end TIMESTAMP WITH TIME ZONE, run_duration_secs INTEGER,
+                run_status TEXT NOT NULL DEFAULT 'success', error_msg TEXT,
+                batch_size INTEGER, rows_loaded_now BIGINT,
+                target_total_records BIGINT, target_today_records BIGINT,
+                target_max_upload_date TIMESTAMP, target_first_upload_date TIMESTAMP,
+                target_max_incremental TEXT, source_total_records BIGINT,
+                source_max_incremental TEXT, source_loaded_to_max_target BIGINT,
+                perc_loaded NUMERIC(6,2), created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type TEXT DEFAULT 'pandas', source_type TEXT DEFAULT 'db'
+            )
+        """))
+        conn.execute(text(
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'"
+        ))
+        conn.execute(text(
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'db'"
+        ))
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status, error_msg,
+                batch_size, rows_loaded_now, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name, :run_id,
+                :run_start, :run_end, :duration, 'failed', :error_msg,
+                0, 0, 'pandas', 'file'
+            )
+        """), {
+            "dag_id":     CONFIG["dag_id"],
+            "env":        env,
+            "schema":     schema,
+            "table_name": table,
+            "run_id":     ctx["run_id"],
+            "run_start":  run_start,
+            "run_end":    run_end,
+            "duration":   duration,
+            "error_msg":  error_msg,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAG definition
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_reload_fn(**ctx):
+    """Branch: on a reload run, skip ingest entirely and go straight to
+    load_to_target (which will read ALL of raw, unscoped, instead of just
+    this run's batch). A reload has no new file involved — letting the
+    sensor run would block for up to 24h waiting for a file that isn't
+    coming.
+    """
+    reload = bool((ctx["dag_run"].conf or {}).get("reload"))
+    return "load_to_target" if reload else "sense_file"
+
+
+default_args = {
+    "owner":            "airflow",
+    "depends_on_past":  False,
+    "retries":          1,
+    "retry_delay":      timedelta(minutes=5),
+    "on_failure_callback": lambda ctx: collect_error_metrics_fn(**ctx),
+}
+
+with DAG(
+    dag_id=CONFIG["dag_id"],
+    default_args=default_args,
+    schedule_interval=CONFIG["schedule_interval"],
+    start_date=datetime.strptime(CONFIG["start_date"], "%Y-%m-%d"),
+    catchup=False,
+    max_active_runs=1,
+    tags=CONFIG["tags"],
+    params={"reload": False},
+    description=(
+        f"File-based ETL — pandas — "
+        f"{CONFIG['source']['file_format'].upper()} → "
+        f"{CONFIG['target']['target_schema']}.{CONFIG['target']['target_table']}"
+    ),
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    check_reload = BranchPythonOperator(
+        task_id="check_reload",
+        python_callable=check_reload_fn,
+    )
+
+    # ── Event-driven sensor: polls watch_path every 60s for a matching file ──
+    sense = PythonSensor(
+        task_id="sense_file",
+        python_callable=sense_file_fn,
+        poke_interval=60,          # check every 60 seconds
+        timeout=86400,             # give up after 24 hours
+        mode="reschedule",         # free the worker slot while waiting
+        soft_fail=True,            # mark as skipped (not failed) on timeout
+    )
+
+    checksum_task = PythonOperator(
+        task_id="compute_checksum",
+        python_callable=compute_checksum,
+    )
+
+    registry_branch = BranchPythonOperator(
+        task_id="check_registry",
+        python_callable=check_registry,
+    )
+
+    already_loaded = PythonOperator(
+        task_id="already_loaded",
+        python_callable=discard_duplicate_file,
+    )
+
+    raw_task = PythonOperator(
+        task_id="load_to_raw",
+        python_callable=load_to_raw,
+    )
+
+    target_task = PythonOperator(
+        task_id="load_to_target",
+        python_callable=load_to_target,
+        # Tolerates its ingest upstream being SKIPPED (the reload bypass
+        # path) rather than succeeded (the normal path) — either way is
+        # fine as long as nothing actually failed.
+        trigger_rule=TriggerRule.NONE_FAILED,
+    )
+
+    archive = PythonOperator(
+        task_id="archive_file",
+        python_callable=archive_file,
+        trigger_rule=TriggerRule.ALL_SUCCESS,  # only archive after a confirmed successful load
+    )
+
+    cleanup = PythonOperator(
+        task_id="cleanup_archive",
+        python_callable=cleanup_archive,
+        trigger_rule=TriggerRule.ALL_SUCCESS,  # only clean up when archive step itself succeeded
+    )
+
+    metrics = PythonOperator(
+        task_id="collect_metrics",
+        python_callable=collect_metrics_fn,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+
+    # ── Task flow ─────────────────────────────────────────────────────────
+    # start → check_reload → sense_file → compute_checksum → check_registry
+    #                     │                                    → load_to_raw ─┐
+    #                     │                                    → already_loaded (archive + delete)
+    #                     └─────────────────────────────────────────────────→ load_to_target
+    #                                                                              ↓
+    #                                              archive_file → cleanup_archive → collect_metrics → end
+
+    start >> check_reload
+    check_reload >> sense
+    check_reload >> target_task
+    sense >> checksum_task >> registry_branch
+    registry_branch >> [raw_task, already_loaded]
+    raw_task >> target_task
+    target_task >> archive >> cleanup >> metrics >> end
+    already_loaded >> end

@@ -1,0 +1,10 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8050:8050"
+    env_file:
+      - .env
+    restart: always
+    volumes:
+      - ./data:/app/data

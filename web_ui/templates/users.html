@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Users</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>User Management</h1>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+        <div class="alert {% if cat == 'error' %}alert-error{% endif %}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card" style="max-width:520px;margin-bottom:24px;">
+      <div class="card-title">Create User</div>
+      <form method="post" action="{{ url_for('create_user') }}">
+        <div class="form-grid" style="grid-template-columns:1fr 1fr;">
+          <div class="form-field">
+            <label>Username</label>
+            <input name="username" required placeholder="Username" />
+          </div>
+          <div class="form-field">
+            <label>Password</label>
+            <input type="password" name="password" required placeholder="Password" />
+          </div>
+        </div>
+        <div class="toggle-field" style="margin:10px 0 14px;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="is_admin" />
+            <span class="toggle-slider"></span>
+          </label>
+          <label>Admin</label>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Create</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <div class="card-title">All Users</div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Username</th>
+            <th>Admin</th>
+            <th>Active</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u[0] }}</td>
+            <td>{{ u[1] }}</td>
+            <td>{{ 'Yes' if u[3] else 'No' }}</td>
+            <td>{{ 'Yes' if u[4] else 'No' }}</td>
+            <td>
+              {% if u[0] != user[0] %}
+              <form method="post" action="{{ url_for('toggle_user', user_id=u[0]) }}" style="display:inline;">
+                <button class="btn btn-secondary">{{ 'Disable' if u[4] else 'Enable' }}</button>
+              </form>
+              {% else %}
+              <span style="color:#aaa;font-size:11px;">(you)</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,2017 @@
+import glob
+import hashlib
+import importlib.util
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
+from pathlib import Path
+from urllib.parse import quote_plus, urlencode, urlsplit, parse_qsl
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator, BranchPythonOperator
+from airflow.sensors.python import PythonSensor
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
+
+modules_path = Variable.get(
+    "modules_path", default_var=os.path.join(os.getcwd(), "dags", "modules")
+)
+if modules_path not in sys.path:
+    sys.path.insert(1, modules_path)
+
+from modules.utils import read_json_file
+from modules.secrets_crypto import decrypt
+
+dag_name = "<dag_name>"
+
+# Many real-world APIs (anything behind Cloudflare or similar) reject
+# urllib's default "Python-urllib/x.y" User-Agent outright with a 403, even
+# for a perfectly legitimate, unauthenticated GET. Always lowest priority in
+# a header merge so a user-configured header can still override it.
+API_JOB_USER_AGENT = "ETL-Manager/1.0"
+# Retries for a single page fetch against transient network errors (timeouts,
+# connection resets, 5xx) — deep pagination against slow APIs tends to get
+# slower page-over-page, so a blip late in a long run shouldn't discard every
+# page already fetched.
+API_PAGE_MAX_RETRIES = 3
+API_PAGE_RETRY_BACKOFF_SECONDS = 5
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_config(dag_name):
+    config_path = Variable.get(
+        "config_path", default_var=os.path.join(os.getcwd(), "dags", "config")
+    )
+    pattern = os.path.join(config_path, "**", f"*{dag_name.lower()}*.json")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        raise FileNotFoundError(
+            f"Config file for '{dag_name}' not found under '{config_path}'"
+        )
+    config = read_json_file(matches[0])
+    env = Variable.get("environment", "dev")
+
+    source_cfg = config["source"].get(env, config["source"])
+    target_cfg = config["target"].get(env, config["target"])
+
+    # ── Source ───────────────────────────────────────────────────────────
+    source_type = config.get("source_type", "file")
+    data_dump_base = Variable.get("data_dump", "/opt/airflow/data_dump")
+    watch_path   = source_cfg.get("watch_path")  or os.path.join(data_dump_base, "incoming")
+    archive_path = source_cfg.get("archive_path") or os.path.join(data_dump_base, "archive")
+
+    # ── Raw / Refined schema + table — FIXED convention, not configurable ──
+    # Raw is a permanent, append-only landing zone shared by every hybrid DAG
+    # on a DB: raw.<target_schema>_<target_table>_raw. It is never truncated,
+    # so it doubles as a durable audit trail a target table can always be
+    # rebuilt from without re-requesting the original source file.
+    #
+    # Refined lives in a shared "pipeline" schema (also table-name-prefixed
+    # with the target schema, since many different targets share this one
+    # schema): pipeline.<target_schema>_<target_table>_refined. It stays
+    # transient (fully rewritten every run) — cleaning runs here, never
+    # against raw.
+    #
+    # This used to be configurable via top-level "raw_schema"/"refined_schema"
+    # keys, but a bug meant they were never actually read (this function only
+    # ever looked for a nested {"raw": {...}} object that no config or the
+    # web UI ever wrote) — every DAG already silently used a fixed location
+    # regardless. Any config still carrying those dead keys is just ignored.
+    if "raw_schema" in config or "refined_schema" in config:
+        logging.warning(
+            "[hybrid] '%s' config has raw_schema/refined_schema keys — these "
+            "are no longer read (the raw/refined location is now fixed, not "
+            "configurable). Safe to delete from the config file.", dag_name
+        )
+
+    tgt_schema_name = (
+        target_cfg.get("target_schema")
+        or target_cfg.get("target_table_schema")
+    )
+    base_name = target_cfg.get("target_table") or target_cfg.get("target_table_name", "unknown")
+    transit_prefix  = f"{tgt_schema_name}_{base_name}"
+
+    raw_schema      = "raw"
+    raw_table       = f"{transit_prefix}_raw"
+    refined_schema  = "pipeline"
+    refined_table   = f"{transit_prefix}_refined"
+    # Raw and refined live in the same DB as the DW target.
+    rw_conn_id = target_cfg.get("target_db_conn_id")
+
+    # ── Cleaning block — None means pass-through copy (no transforms) ────
+    # In the config JSON set  "cleaning": null  (or omit the key) to skip
+    # cleaning and just copy raw → refined as-is.
+    # To enable cleaning add:
+    #   "cleaning": {
+    #       "sql_queries": ["UPDATE raw.tbl_raw SET col = TRIM(col)", ...],
+    #       "script_path": "customer_clean.py",          ← relative to cleaning_files_path
+    #       "functions":   ["run_sql_queries", "update_provinces_with_fuzzy_matching"]
+    #   }
+    cleaning = config.get("cleaning")
+
+    # ── api source ── (only populated/used when source_type == "api"; every
+    # key defaults harmlessly to empty for file/db configs, same as the file
+    # keys already default harmlessly for a db config and vice versa)
+    auth_cfg            = source_cfg.get("auth", {}) or {}
+    response_format_cfg = source_cfg.get("response_format", {}) or {}
+    pagination_cfg       = source_cfg.get("pagination", {}) or {}
+    hwm_cfg              = source_cfg.get("hwm") or {}
+
+    return {
+        "dag_id":            config.get("dag_id", f"HYBRID_{dag_name}"),
+        "schedule_interval": config.get("schedule_interval"),
+        "start_date":        config.get("start_date", "2023-01-01"),
+        "source_type":       source_type,
+        "source": {
+            # ── file source ──
+            "watch_path":             watch_path,
+            "file_name":              source_cfg.get("file_name", ""),
+            "file_format":            source_cfg.get("file_format", "csv"),
+            "delimiter":              source_cfg.get("delimiter", ","),
+            "encoding":               source_cfg.get("encoding", "auto"),
+            "has_header":             source_cfg.get("has_header", True),
+            "null_values":            source_cfg.get("null_values", ["", "NULL", "null", "None", "NA", "N/A", "n/a", "#N/A"]),
+            "date_columns":           source_cfg.get("date_columns", []),
+            "dtype_overrides":        source_cfg.get("dtype_overrides", {}),
+            "dtype_override_formats": source_cfg.get("dtype_override_formats", {}),
+            "skip_rows":              source_cfg.get("skip_rows", 0),
+            "archive_path":           archive_path,
+            "archive_retention_days": int(source_cfg.get("archive_retention_days", 30)),
+            # ── db source ──
+            "source_db_conn_id":   source_cfg.get("source_db_conn_id"),
+            "source_table_schema": source_cfg.get("source_table_schema"),
+            "source_table_name":   source_cfg.get("source_table_name"),
+            "sql_file":            source_cfg.get("sql_file"),
+            "full_load":           source_cfg.get("full_load", True),
+            "batch_size":          source_cfg.get("batch_size"),
+            # ── api source ──
+            # url_mode "full": the whole request URL (query string, token/key
+            # embedded and all) is stored as one encrypted secret rather than
+            # split into base_url + a separate auth mechanism — see
+            # fetch_api_pages(). base_url/data_endpoint/auth below are simply
+            # unused in that mode.
+            "url_mode":        source_cfg.get("url_mode", "separate"),
+            "full_url_enc":    source_cfg.get("full_url_enc", ""),
+            "base_url":        (source_cfg.get("base_url") or "").rstrip("/"),
+            "data_endpoint":   source_cfg.get("data_endpoint", ""),
+            "http_method":     (source_cfg.get("http_method") or "GET").upper(),
+            "request_params":  source_cfg.get("request_params", {}) or {},
+            "request_headers": source_cfg.get("request_headers", {}) or {},
+            "timeout_seconds": int(source_cfg.get("timeout_seconds", 30) or 30),
+            "auth": auth_cfg,
+            "response_format": {
+                "type":         response_format_cfg.get("type", "json_array"),
+                "records_path": response_format_cfg.get("records_path", ""),
+            },
+            "pagination": {
+                "strategy":                 pagination_cfg.get("strategy", "none"),
+                "page_size":                int(pagination_cfg.get("page_size", 100) or 100),
+                "offset_param":             pagination_cfg.get("offset_param", "offset"),
+                "limit_param":              pagination_cfg.get("limit_param", "limit"),
+                "page_param":               pagination_cfg.get("page_param", "page"),
+                "page_size_param":          pagination_cfg.get("page_size_param", "page_size"),
+                "start_page":               int(pagination_cfg.get("start_page", 1) or 1),
+                "cursor_param":             pagination_cfg.get("cursor_param", "cursor"),
+                "cursor_response_field":    pagination_cfg.get("cursor_response_field", ""),
+                "next_link_response_field": pagination_cfg.get("next_link_response_field", "next"),
+                # Always enforced, regardless of source config — a hard backstop
+                # against a misbehaving/misconfigured API paginating forever.
+                "max_pages":                max(1, int(pagination_cfg.get("max_pages", 500) or 500)),
+                "stop_when_empty":          pagination_cfg.get("stop_when_empty", True),
+            },
+            # Each filter is applied as a literal query param — there is no
+            # generic way to translate ">"/"AND"/"OR" into an arbitrary API's
+            # own filter syntax, so the wizard has the user name the exact
+            # param their API expects (api_param). All configured filters are
+            # ANDed together (merged into one params dict); "OR" is accepted
+            # in the UI as a label but not enforced at runtime — see the
+            # design note in fetch_api_pages() below.
+            "filters": source_cfg.get("filters", []) or [],
+            "hwm": {
+                "column":          hwm_cfg.get("column", ""),
+                "column_datatype": hwm_cfg.get("column_datatype", ""),
+                "date_format":     hwm_cfg.get("date_format", ""),
+                "request_param":   hwm_cfg.get("request_param", ""),
+            },
+        },
+        "raw": {
+            "conn_id": rw_conn_id,
+            "schema":  raw_schema,
+            "table":   raw_table,
+        },
+        "refined": {
+            "conn_id": rw_conn_id,
+            "schema":  refined_schema,
+            "table":   refined_table,
+        },
+        "cleaning": cleaning,
+        "target": {
+            "target_db_conn_id": target_cfg.get("target_db_conn_id"),
+            "target_schema":     target_cfg.get("target_schema") or target_cfg.get("target_table_schema"),
+            "target_table":      target_cfg.get("target_table")  or target_cfg.get("target_table_name"),
+            "db_type":           target_cfg.get("db_type", "postgresql"),
+        },
+        "rename_columns":  config.get("rename_columns", []),
+        "tags":            config.get("tags", ["hybrid", "ETL"]),
+        "read_chunk_size": config.get("read_chunk_size", 50000),
+    }
+
+
+CONFIG       = load_config(dag_name)
+IS_FILE_SRC  = CONFIG["source_type"] == "file"
+IS_API_SRC   = CONFIG["source_type"] == "api"
+HAS_CLEANING = bool(CONFIG.get("cleaning"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File helpers  (same as file_load.template)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_file(watch_path, file_name):
+    if not os.path.isdir(watch_path):
+        return None
+    fpath = os.path.join(watch_path, file_name)
+    return fpath if os.path.isfile(fpath) else None
+
+
+def _compute_md5(file_path):
+    h = hashlib.md5()
+    with open(file_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _clean_col(name):
+    name = unicodedata.normalize("NFD", str(name))
+    name = "".join(c for c in name if unicodedata.category(c) != "Mn")
+    name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    reserved = {"from", "select", "where", "group", "order", "having",
+                "user", "table", "index", "start", "end", "begin", "if"}
+    if name in reserved:
+        name = name + "_"
+    return name or "col"
+
+
+def _detect_encoding(path):
+    try:
+        import chardet
+        with open(path, "rb") as fh:
+            sample = fh.read(65536)
+        result = chardet.detect(sample)
+        enc = result.get("encoding") or "utf-8"
+        enc = enc.upper().replace("-", "")
+        aliases = {"ASCII": "utf-8", "UTF8": "utf-8", "UTF8BOM": "utf-8-sig",
+                   "UTF16": "utf-16", "LATIN1": "latin-1", "ISO88591": "latin-1"}
+        return aliases.get(enc, result.get("encoding", "utf-8"))
+    except Exception:
+        return "utf-8"
+
+
+def _universal_to_datetime(series, hint_fmt=None):
+    import pandas as pd
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series
+    upper = (hint_fmt or "").upper().strip()
+    dayfirst = upper.startswith("DD")
+    if pd.api.types.is_integer_dtype(series) or pd.api.types.is_float_dtype(series):
+        unit = "ms" if (series.abs() > 2e10).any() else "s"
+        parsed = pd.to_datetime(series, unit=unit, errors="coerce")
+        failed = parsed.isna() & series.notna()
+        if failed.any():
+            bad = series[failed].dropna().unique()[:10]
+            raise ValueError(
+                f"[hybrid] Cannot parse {failed.sum()} value(s) in '{series.name}' as epoch. "
+                f"Bad values: {list(bad)}"
+            )
+        return parsed
+    parsed = pd.to_datetime(series, dayfirst=dayfirst, infer_datetime_format=True, errors="coerce")
+    failed = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+    if failed.any():
+        try:
+            numeric = pd.to_numeric(series[failed], errors="raise")
+            unit = "ms" if (numeric.abs() > 2e10).any() else "s"
+            parsed = parsed.copy()
+            parsed.loc[failed] = pd.to_datetime(numeric, unit=unit, errors="coerce")
+            failed = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+        except (ValueError, TypeError):
+            pass
+    if failed.any():
+        from dateutil import parser as _du
+        def _try_du(v):
+            try:
+                return _du.parse(str(v), dayfirst=dayfirst)
+            except Exception:
+                return pd.NaT
+        parsed = parsed.copy()
+        parsed.loc[failed] = series[failed].apply(_try_du)
+        failed = parsed.isna() & series.notna() & (series.astype(str).str.strip() != "")
+    if failed.any():
+        bad = series[failed].dropna().unique()[:10]
+        raise ValueError(
+            f"[hybrid] Cannot parse {failed.sum()} value(s) in '{series.name}'. "
+            f"Bad values: {list(bad)}"
+        )
+    return parsed
+
+
+def _read_file(cfg, file_path):
+    import numpy as np
+    import pandas as pd
+    file_format = cfg["file_format"].lower()
+    null_vals   = cfg["null_values"]
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"[hybrid] Source file not found: {file_path}")
+    if file_format == "parquet":
+        df = pd.read_parquet(file_path)
+        df.columns = [_clean_col(c) for c in df.columns]
+        return df
+    enc_cfg  = cfg.get("encoding", "auto")
+    encoding = _detect_encoding(file_path) if enc_cfg == "auto" else enc_cfg
+    read_kw  = dict(
+        filepath_or_buffer=file_path,
+        sep=cfg.get("delimiter", ","),
+        header=0 if cfg.get("has_header", True) else None,
+        skiprows=cfg.get("skip_rows", 0) or None,
+        encoding=encoding,
+        encoding_errors="replace",
+        na_values=null_vals,
+        keep_default_na=True,
+        low_memory=False,
+        dtype=str,
+    )
+    try:
+        df = pd.read_csv(**read_kw)
+    except UnicodeDecodeError:
+        logging.warning("[hybrid] Encoding fallback to latin-1")
+        read_kw["encoding"] = "latin-1"
+        df = pd.read_csv(**read_kw)
+    df.columns = [_clean_col(c) for c in df.columns]
+    str_cols = df.select_dtypes(include="object").columns
+    df[str_cols] = df[str_cols].apply(lambda s: s.str.strip())
+    null_set = {str(v).strip().lower() for v in null_vals}
+    for col in str_cols:
+        df[col] = df[col].where(~df[col].str.lower().isin(null_set), other=np.nan)
+    ctrl_re = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+    for col in str_cols:
+        df[col] = df[col].apply(lambda x: ctrl_re.sub("", x) if isinstance(x, str) else x)
+    return df
+
+
+def _cast_types(df, cfg):
+    import pandas as pd
+    date_cols       = cfg.get("date_columns", [])
+    dtype_overrides = cfg.get("dtype_overrides", {})
+    fmt_hints       = cfg.get("dtype_override_formats", {})
+    for raw_col, dtype in dtype_overrides.items():
+        col = _clean_col(raw_col)
+        if col not in df.columns:
+            continue
+        try:
+            d = dtype.lower()
+            if d in ("int", "int64", "integer", "bigint"):
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+            elif d in ("float", "float64", "numeric", "decimal"):
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            elif d in ("bool", "boolean"):
+                df[col] = df[col].map({"true": True, "false": False, "1": True, "0": False,
+                                       "yes": True, "no": False, "y": True, "n": False})
+            elif d in ("date", "timestamp", "datetime"):
+                hint = fmt_hints.get(raw_col) or fmt_hints.get(col)
+                df[col] = _universal_to_datetime(df[col], hint_fmt=hint)
+            else:
+                df[col] = df[col].astype(str)
+        except ValueError:
+            raise
+        except Exception as exc:
+            logging.warning("[hybrid] dtype override failed for '%s': %s", col, exc)
+    already = {_clean_col(c) for c in dtype_overrides}
+    for raw_col in date_cols:
+        col = _clean_col(raw_col)
+        if col in df.columns and col not in already:
+            hint = fmt_hints.get(raw_col) or fmt_hints.get(col)
+            df[col] = _universal_to_datetime(df[col], hint_fmt=hint)
+    date_set = {_clean_col(c) for c in date_cols}
+    for col in df.select_dtypes(include="object").columns:
+        if col in already or col in date_set:
+            continue
+        numeric  = pd.to_numeric(df[col], errors="coerce")
+        non_null = df[col].notna().sum()
+        parsed   = numeric.notna().sum()
+        if non_null > 0 and parsed / non_null >= 0.8:
+            df[col] = numeric
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DB engine helper
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ENGINE_CACHE: dict = {}
+
+
+def _get_engine(conn_id):
+    if conn_id in _ENGINE_CACHE:
+        return _ENGINE_CACHE[conn_id]
+    from airflow.hooks.base import BaseHook
+    from sqlalchemy import create_engine
+    conn = BaseHook.get_connection(conn_id)
+    port = conn.port or 5432
+    pwd  = quote_plus(str(conn.password or ""))
+    url  = f"postgresql+psycopg2://{conn.login}:{pwd}@{conn.host}:{port}/{conn.schema}"
+    _ENGINE_CACHE[conn_id] = create_engine(url, pool_pre_ping=True)
+    return _ENGINE_CACHE[conn_id]
+
+
+def _pg_copy_df(df, schema, table, engine):
+    import io
+    buf = io.StringIO()
+    df.to_csv(buf, index=False, na_rep="")
+    buf.seek(0)
+    col_sql = ", ".join(f'"{c}"' for c in df.columns)
+    raw_conn = engine.raw_connection()
+    try:
+        cur = raw_conn.cursor()
+        cur.copy_expert(
+            f'COPY "{schema}"."{table}" ({col_sql}) FROM STDIN WITH (FORMAT CSV, HEADER TRUE)',
+            buf,
+        )
+        cur.close()
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+
+
+def _ensure_schema(conn_id, schema):
+    from sqlalchemy import text
+    engine = _get_engine(conn_id)
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+
+
+def _ensure_table_from_df(df, conn_id, schema, table):
+    """Create table from DataFrame column structure if it does not exist yet."""
+    from sqlalchemy import text
+    engine = _get_engine(conn_id)
+    col_defs = ", ".join(f'"{c}" TEXT' for c in df.columns)
+    with engine.begin() as conn:
+        conn.execute(text(
+            f'CREATE TABLE IF NOT EXISTS "{schema}"."{table}" ({col_defs})'
+        ))
+        # Add any columns that are in the DataFrame but missing from the table
+        # (handles schema evolution between runs).
+        for col in df.columns:
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{table}" '
+                f'ADD COLUMN IF NOT EXISTS "{col}" TEXT'
+            ))
+
+
+def _ensure_registry_table(conn):
+    from sqlalchemy import text
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS pipeline.file_load_registry (
+            id              SERIAL PRIMARY KEY,
+            dag_id          TEXT,
+            target_schema   TEXT,
+            target_table    TEXT,
+            file_name       TEXT,
+            file_path       TEXT,
+            file_checksum   TEXT,
+            file_size_bytes BIGINT,
+            rows_loaded     BIGINT,
+            run_id          TEXT,
+            loaded_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            archived_to     TEXT,
+            archived_at     TIMESTAMP WITH TIME ZONE
+        )
+    """))
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_hybrid_registry_checksum
+            ON pipeline.file_load_registry (target_schema, target_table, file_checksum)
+    """))
+
+
+def _checksum_registered(schema, table, checksum):
+    from sqlalchemy import text
+    engine = _get_engine(CONFIG["raw"]["conn_id"])
+    with engine.begin() as conn:
+        _ensure_registry_table(conn)
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT 1 FROM pipeline.file_load_registry
+                WHERE target_schema = :s AND target_table = :t AND file_checksum = :c
+                LIMIT 1
+            """),
+            {"s": schema, "t": table, "c": checksum},
+        )
+        return row.fetchone() is not None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API helpers — auth, pagination, response parsing (only exercised when
+# source_type == "api"; inert for file/db sources)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_nested(d, dotted_path):
+    """Resolve a dotted path like 'data.results' or 'data.access_token' against
+    a parsed JSON value. A numeric path segment indexes into a list, e.g.
+    'data.0.token'. Returns None if any segment along the way is missing."""
+    if not dotted_path:
+        return d
+    cur = d
+    for part in dotted_path.split("."):
+        if cur is None:
+            return None
+        if isinstance(cur, list):
+            try:
+                cur = cur[int(part)]
+            except (ValueError, IndexError):
+                return None
+        elif isinstance(cur, dict):
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _resolve_auth(auth_cfg):
+    """Build the (headers, params) needed to authenticate outbound API
+    requests. Exactly one of the two is populated, depending on auth type —
+    everything merges into the same request either way.
+
+    Runs once at the very start of the (single) ingest task and the result is
+    reused in-process for every page fetch in this run. Deliberately never
+    XCom-pushed and never logged: XCom values land in the Airflow metadata DB
+    and are visible in the Airflow UI to anyone with DAG-view permission —
+    splitting "fetch token" and "fetch pages" into separate tasks connected
+    by XCom would leak a live bearer token there.
+    """
+    auth_type = (auth_cfg or {}).get("type", "none")
+    if auth_type == "none" or not auth_cfg:
+        return {}, {}
+
+    if auth_type == "api_key_header":
+        header_name = auth_cfg.get("header_name") or "Authorization"
+        key = decrypt(auth_cfg.get("api_key_enc", ""))
+        if not key:
+            raise ValueError("[hybrid] auth.type=api_key_header but no api_key_enc is configured.")
+        return {header_name: key}, {}
+
+    if auth_type == "api_key_query_param":
+        # Common for ArcGIS/Esri FeatureServer/MapServer REST endpoints and
+        # similar services that expect a static token as a query string
+        # value (e.g. "...&token=..."), not a header. Still encrypted at
+        # rest exactly like api_key_header — only *where* it's sent differs.
+        param_name = auth_cfg.get("param_name") or "token"
+        key = decrypt(auth_cfg.get("api_key_enc", ""))
+        if not key:
+            raise ValueError("[hybrid] auth.type=api_key_query_param but no api_key_enc is configured.")
+        return {}, {param_name: key}
+
+    if auth_type == "login_token":
+        token_endpoint = auth_cfg.get("token_endpoint")
+        if not token_endpoint:
+            raise ValueError("[hybrid] auth.type=login_token requires a token_endpoint.")
+        username       = auth_cfg.get("token_username", "")
+        password       = decrypt(auth_cfg.get("token_password_enc", ""))
+        username_field = auth_cfg.get("token_username_field", "username")
+        password_field = auth_cfg.get("token_password_field", "password")
+        body_type      = (auth_cfg.get("token_request_body_type") or "json").lower()
+        payload        = {username_field: username, password_field: password}
+
+        if body_type == "form":
+            data    = urlencode(payload).encode()
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        else:
+            data    = json.dumps(payload).encode()
+            headers = {"Content-Type": "application/json"}
+
+        req = urllib.request.Request(
+            token_endpoint, data=data, headers={"User-Agent": API_JOB_USER_AGENT, **headers}, method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"[hybrid] login_token: failed to fetch token from {token_endpoint}: {exc}") from exc
+
+        token_field = auth_cfg.get("token_response_field", "access_token")
+        token = _get_nested(body, token_field)
+        if not token:
+            raise ValueError(f"[hybrid] login_token: response did not contain a '{token_field}' field.")
+
+        header_name = auth_cfg.get("token_header_name") or "Authorization"
+        # `or`, not a .get() default — a present-but-empty value must still
+        # default to "Bearer ", since .get(key, default) only falls back
+        # when the key itself is entirely absent.
+        prefix      = auth_cfg.get("token_header_prefix") or "Bearer "
+        return {header_name: f"{prefix}{token}"}, {}
+
+    raise ValueError(f"[hybrid] Unknown auth.type: {auth_type}")
+
+
+def _extract_error_envelope(parsed):
+    """Return a human-readable error message if `parsed` looks like a common
+    REST API error envelope (a top-level dict with an "error" key). Plenty of
+    real-world APIs report failures this way with an HTTP 200 status — the
+    error is only visible in the body, e.g. ArcGIS/Esri Server responding
+    {"error": {"code": 498, "message": "Invalid Token"}} with a 200. Checking
+    HTTP status alone misses these entirely — without this, an expired
+    token/bad request would silently load a single bogus "error" row into
+    raw/refined/DW every run instead of failing the task loudly.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    err = parsed.get("error")
+    if err is None:
+        return None
+    if isinstance(err, dict):
+        msg  = err.get("message") or err.get("details") or str(err)
+        code = err.get("code")
+        return f"{msg} (code {code})" if code is not None else str(msg)
+    return str(err)
+
+
+def _parse_page(body_bytes, response_format):
+    """Extract (records, raw_parsed_body) from one page's response body.
+
+    raw_parsed_body is the whole decoded JSON value (needed so cursor/
+    next-link pagination can read metadata fields alongside the records) —
+    it's None for ndjson, where there's no single top-level object to read
+    such fields from (cursor/next_link pagination pairs with json_array /
+    json_object_path responses in practice).
+    """
+    fmt = (response_format or {}).get("type", "json_array")
+    text_body = body_bytes.decode("utf-8", errors="replace")
+
+    if fmt == "ndjson":
+        records = []
+        for line in text_body.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parsed_line = json.loads(line)
+            records.append(parsed_line if isinstance(parsed_line, dict) else {"value": parsed_line})
+        return records, None
+
+    parsed = json.loads(text_body) if text_body.strip() else None
+    if fmt == "json_object_path":
+        records = _get_nested(parsed, (response_format or {}).get("records_path", ""))
+    else:  # json_array (also the fallback for an unrecognized format)
+        records = parsed
+
+    if records is None:
+        records = []
+    elif isinstance(records, dict):
+        records = [records]
+    if not isinstance(records, list):
+        records = []
+    return [r for r in records if isinstance(r, dict)], parsed
+
+
+def _build_page_request(base_url, data_endpoint, base_params, pagination_cfg,
+                         page_num, cursor_value, next_link_url):
+    """Returns (url, params) for the next page fetch. When the next_link
+    strategy has an absolute URL from the previous response, params is None
+    and the URL is used exactly as given (it already carries whatever query
+    string the API wants)."""
+    strategy = pagination_cfg.get("strategy", "none")
+    url = base_url + data_endpoint
+
+    if strategy == "next_link" and next_link_url:
+        return next_link_url, None
+
+    params = dict(base_params)
+    if strategy == "offset_limit":
+        page_size = pagination_cfg["page_size"]
+        params[pagination_cfg["offset_param"]] = page_num * page_size
+        params[pagination_cfg["limit_param"]]  = page_size
+    elif strategy == "page_number":
+        params[pagination_cfg["page_param"]]      = pagination_cfg["start_page"] + page_num
+        params[pagination_cfg["page_size_param"]] = pagination_cfg["page_size"]
+    elif strategy == "cursor" and cursor_value:
+        params[pagination_cfg["cursor_param"]] = cursor_value
+    # strategy == "none", or the first cursor page (no cursor yet): base params only.
+
+    return url, params
+
+
+def fetch_api_pages(cfg, run_hwm_value):
+    """Loop through pages per the configured pagination strategy and return
+    the flattened list of record dicts.
+
+    Filters and the HWM value are merged into the request params BEFORE the
+    first page fetch, so filtering happens server-side on the external API —
+    not by pulling everything and filtering client-side. This is what lets
+    this scale to large result sets instead of re-pulling the whole dataset
+    every run.
+    """
+    pagination_cfg  = cfg["pagination"]
+    response_format = cfg["response_format"]
+    strategy        = pagination_cfg.get("strategy", "none")
+    max_pages       = pagination_cfg["max_pages"]
+
+    # "full" mode: the whole request URL (path + query string, token/key
+    # embedded and all — e.g. pasted straight out of Postman) is encrypted
+    # as one unit rather than split into base_url + a separate auth
+    # mechanism. Its existing query params become the request's baseline —
+    # this is what carries the embedded token through untouched, without
+    # this code needing to know or care what that param is even called —
+    # filters/HWM/pagination params still layer on top exactly as usual.
+    if cfg.get("url_mode") == "full":
+        full_url = decrypt(cfg.get("full_url_enc", ""))
+        if not full_url:
+            raise ValueError("[hybrid] url_mode=full but no full_url_enc is configured.")
+        parts = urlsplit(full_url)
+        base_url      = f"{parts.scheme}://{parts.netloc}{parts.path}"
+        data_endpoint = ""
+        base_params   = dict(parse_qsl(parts.query, keep_blank_values=True))
+        auth_headers  = {}
+    else:
+        base_url      = cfg["base_url"]
+        data_endpoint = cfg["data_endpoint"]
+        auth_headers, auth_params = _resolve_auth(cfg.get("auth"))
+        base_params   = dict(cfg.get("request_params") or {})
+        base_params.update(auth_params)
+
+    for f in cfg.get("filters") or []:
+        api_param = f.get("api_param")
+        if api_param and f.get("value") not in (None, ""):
+            base_params[api_param] = f["value"]
+
+    hwm_cfg = cfg.get("hwm") or {}
+    if hwm_cfg.get("request_param") and run_hwm_value is not None:
+        base_params[hwm_cfg["request_param"]] = (
+            run_hwm_value.isoformat() if hasattr(run_hwm_value, "isoformat") else run_hwm_value
+        )
+
+    all_records   = []
+    cursor_value  = None
+    next_link_url = None
+    page_num      = 0
+
+    while page_num < max_pages:
+        url, params = _build_page_request(
+            base_url, data_endpoint, base_params, pagination_cfg,
+            page_num, cursor_value, next_link_url,
+        )
+        query = ("?" + urlencode(params)) if params else ""
+        req = urllib.request.Request(
+            url + query,
+            headers={"User-Agent": API_JOB_USER_AGENT, **cfg.get("request_headers", {}), **auth_headers},
+            method=cfg.get("http_method", "GET"),
+        )
+        logging.info("[ingest.load_to_raw] Fetching page %d from %s", page_num + 1, url)
+        # Deep pagination against slow external APIs (ArcGIS/Esri FeatureServers
+        # among them) tends to get slower page-over-page, eventually tripping the
+        # per-request timeout — retry transient network errors a few times with
+        # backoff instead of throwing away every already-fetched page over one blip.
+        body = None
+        last_exc = None
+        for attempt in range(1, API_PAGE_MAX_RETRIES + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=cfg.get("timeout_seconds", 30)) as resp:
+                    body = resp.read()
+                break
+            except urllib.error.HTTPError as exc:
+                # 4xx is the caller's fault (bad request/auth/etc) — retrying won't help.
+                if exc.code < 500 or attempt == API_PAGE_MAX_RETRIES:
+                    raise RuntimeError(f"[hybrid] HTTP {exc.code} fetching {url}: {exc.reason}") from exc
+                last_exc = exc
+            except urllib.error.URLError as exc:
+                if attempt == API_PAGE_MAX_RETRIES:
+                    raise RuntimeError(f"[hybrid] Failed to reach {url}: {exc.reason}") from exc
+                last_exc = exc
+            backoff = API_PAGE_RETRY_BACKOFF_SECONDS * attempt
+            logging.warning(
+                "[ingest.load_to_raw] Page %d attempt %d/%d failed (%s) — retrying in %ds",
+                page_num + 1, attempt, API_PAGE_MAX_RETRIES, last_exc, backoff,
+            )
+            time.sleep(backoff)
+
+        records, parsed_body = _parse_page(body, response_format)
+
+        # Many real-world APIs (ArcGIS/Esri Server among them) report
+        # failures as HTTP 200 with an error envelope in the body — fail the
+        # task loudly here rather than silently loading a bogus "error" row.
+        env_error = _extract_error_envelope(parsed_body)
+        if env_error:
+            raise RuntimeError(f"[hybrid] API returned an error on page {page_num + 1}: {env_error}")
+
+        all_records.extend(records)
+        page_num += 1
+
+        if strategy == "none":
+            break
+        if pagination_cfg.get("stop_when_empty", True) and not records:
+            break
+        if strategy == "cursor":
+            cursor_value = _get_nested(parsed_body, pagination_cfg.get("cursor_response_field", ""))
+            if not cursor_value:
+                break
+        elif strategy == "next_link":
+            next_link_url = _get_nested(parsed_body, pagination_cfg.get("next_link_response_field", ""))
+            if not next_link_url:
+                break
+        elif strategy in ("offset_limit", "page_number"):
+            if len(records) < pagination_cfg["page_size"]:
+                break  # short page — this was the last one
+
+    if page_num >= max_pages:
+        logging.warning(
+            "[ingest.load_to_raw] Hit max_pages=%d safety cap — there may be more data "
+            "than was fetched this run.", max_pages,
+        )
+
+    return all_records
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# High-water-mark helpers — read from the TARGET table, same convention as
+# data_load.template's get_last_loaded_value() for DB-to-DB jobs. Only used
+# for an api-sourced job with an hwm.column configured (file/db sources have
+# no incremental concept in this template — db incrementality lives in the
+# separate data_load.template).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INTEGER_DB_KINDS = frozenset({
+    "integer", "int", "int2", "int4", "int8", "bigint", "smallint",
+    "serial", "bigserial", "smallserial",
+})
+_DATETIME_DB_KINDS = frozenset({
+    "date", "timestamp", "timestamp without time zone",
+    "timestamp with time zone", "timestamptz",
+})
+
+_INCR_TYPE_CACHE: dict = {}
+
+
+def _probe_incr_col(conn_id, schema, table, column):
+    key = (conn_id, schema, table, column)
+    if key in _INCR_TYPE_CACHE:
+        return _INCR_TYPE_CACHE[key]
+    from sqlalchemy import text
+    kind = "text"
+    try:
+        engine = _get_engine(conn_id)
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = :s AND table_name = :t AND column_name = :c "
+                "LIMIT 1"
+            ), {"s": schema, "t": table, "c": column}).fetchone()
+            if row:
+                dt = row[0].lower()
+                if dt in _INTEGER_DB_KINDS or dt.startswith("int") or "serial" in dt:
+                    kind = "integer"
+                elif dt in _DATETIME_DB_KINDS or dt.startswith("timestamp") or dt == "date":
+                    kind = "datetime"
+    except Exception as exc:
+        logging.warning(
+            "[hybrid.probe_incr_col] Cannot detect type for %s.%s.%s — defaulting to 'text': %s",
+            schema, table, column, exc,
+        )
+    _INCR_TYPE_CACHE[key] = kind
+    return kind
+
+
+def _resolve_incr_kind(conn_id, schema, table, column, override=""):
+    override = (override or "").lower()
+    if override in ("int", "bigint", "integer", "numeric", "smallint"):
+        return "integer"
+    if override in ("date", "timestamp", "datetime", "timestamptz",
+                    "timestamp with time zone", "timestamp without time zone"):
+        return "datetime"
+    return _probe_incr_col(conn_id, schema, table, column)
+
+
+def _incr_sql_expr(column, kind, explicit_fmt=""):
+    if kind == "integer":
+        return f'CAST("{column}" AS BIGINT)'
+    if kind == "datetime":
+        return f'"{column}"'
+    if explicit_fmt:
+        return f"TO_TIMESTAMP(\"{column}\", '{explicit_fmt}')"
+    return f'CAST("{column}" AS TIMESTAMP)'
+
+
+def _auto_set_datestyle(conn, base_sql, column):
+    """Sample `column`, inspect the raw text value, and issue the appropriate
+    PostgreSQL SET datestyle so CAST(col AS TIMESTAMP) succeeds for common
+    text-stored date formats. Identical to data_load.template's helper."""
+    from sqlalchemy import text
+    import re as _re
+    try:
+        val = conn.execute(
+            text(f"SELECT {column}::text FROM ({base_sql}) _s "
+                 f"WHERE {column} IS NOT NULL LIMIT 1")
+        ).scalar()
+        if not val:
+            return
+        val = str(val).strip()
+        if _re.match(r'^\d{4}[\-/]\d{2}[\-/]\d{2}', val):
+            return
+        m = _re.match(r'^(\d{1,2})[\-/\.](\d{1,2})[\-/\.](\d{2,4})', val)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a > 12:
+                conn.execute(text("SET datestyle = 'ISO, DMY'"))
+            elif b > 12:
+                conn.execute(text("SET datestyle = 'ISO, MDY'"))
+            else:
+                conn.execute(text("SET datestyle = 'ISO, DMY'"))
+    except Exception as exc:
+        logging.warning("[hybrid] _auto_set_datestyle: could not detect format: %s", exc)
+
+
+def get_last_loaded_value():
+    """Return the current HWM from the TARGET table (never a separate state
+    store), or None on first run / when no HWM column is configured — the
+    same convention data_load.template uses for DB-to-DB incremental loads.
+    Only meaningful for an api-sourced job.
+    """
+    from sqlalchemy import text
+
+    hwm    = CONFIG["source"].get("hwm") or {}
+    column = hwm.get("column")
+    if not column:
+        return None
+
+    schema  = CONFIG["target"]["target_schema"]
+    table   = CONFIG["target"]["target_table"]
+    conn_id = CONFIG["target"]["target_db_conn_id"]
+
+    kind = _resolve_incr_kind(conn_id, schema, table, column, override=hwm.get("column_datatype", ""))
+    # Never pass the user-supplied date_format into the HWM query itself —
+    # TO_TIMESTAMP with a mismatched format silently misreads digits (see
+    # data_load.template's identical comment). Auto-sniff the stored format
+    # from a sample row instead, for text-stored dates.
+    cast_expr = _incr_sql_expr(column, kind, explicit_fmt="")
+    future_guard = (
+        f" WHERE {cast_expr} <= NOW() + INTERVAL '1 year'" if kind != "integer" else ""
+    )
+
+    engine = _get_engine(conn_id)
+    try:
+        with engine.connect() as conn:
+            if kind == "text":
+                _auto_set_datestyle(conn, f'SELECT * FROM "{schema}"."{table}"', f'"{column}"')
+            row = conn.execute(text(
+                f'SELECT MAX({cast_expr}) AS max_val FROM "{schema}"."{table}"{future_guard}'
+            )).fetchone()
+            value = row[0] if row else None
+        if value is not None:
+            logging.info("[hybrid.get_last_loaded_value] HWM = %s (%s)", value, type(value).__name__)
+        else:
+            logging.info("[hybrid.get_last_loaded_value] %s.%s is empty — first incremental load.", schema, table)
+        return value
+    except Exception as exc:
+        logging.warning(
+            "[hybrid.get_last_loaded_value] Could not read HWM from %s.%s (%s) — treating as first load.",
+            schema, table, exc,
+        )
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline metadata columns added to every table
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PIPELINE_META = [
+    "_pipeline_inserted_at",
+    "_pipeline_run_id",
+    "_source_file",
+    "_file_checksum",
+    "_source_system",
+    "_loaded_at",
+    "_row_checksum",
+]
+
+_META_COL_TYPES = {
+    "_pipeline_inserted_at": "TIMESTAMP",
+    "_pipeline_run_id":      "TEXT",
+    "_source_file":          "TEXT",
+    "_file_checksum":        "TEXT",
+    "_source_system":        "TEXT",
+    "_loaded_at":            "TIMESTAMP",
+    "_row_checksum":         "TEXT",
+}
+
+
+def _add_meta(df, run_id, file_name=None, checksum=None, preserve_inserted_at=False):
+    """Prepend pipeline metadata columns to df (in-place copy).
+
+    preserve_inserted_at=True keeps the df's existing _pipeline_inserted_at
+    instead of stamping a fresh one. Only load_to_dw passes it: that df is
+    the pipeline's OWN refined data, and the column has to survive into
+    target unchanged as the original raw-ingest moment so it can act as the
+    watermark refine_data() reads back (once a row's _pipeline_inserted_at
+    is in target, everything in raw up to that timestamp is fully processed,
+    so only newer rows need looking at — this run's fresh batch or a backlog
+    stranded by an earlier run's failed refine/dw_load).
+
+    Ingest deliberately does NOT pass it. Inferring "preserve" from the
+    column merely being present would misfire on a source that legitimately
+    carries that name — most realistically a DB job whose SQL selects from a
+    table THIS pipeline produced (the DB branch doesn't run column names
+    through _clean_col, so the name arrives intact). Its upstream timestamps
+    would then become this pipeline's watermark, and any of its rows older
+    than what's already in target would be skipped by refine forever.
+    """
+    import pandas as pd
+
+    now = datetime.utcnow()
+    # Coerce to a real datetime64 dtype rather than whatever it currently is
+    # (raw/refined store it as plain TEXT, so a read-back is a string) —
+    # this value ends up driving a pandas-inferred CREATE TABLE (the DW
+    # staging table, and — on a first-ever run — the target table itself),
+    # so an object/string dtype here would make that column TEXT instead of
+    # TIMESTAMP, breaking the INSERT into a target whose column is already
+    # TIMESTAMP from an earlier run, and breaking refine_data()'s own
+    # `::timestamp` watermark comparison against it.
+    preserved_inserted_at = (
+        pd.to_datetime(df["_pipeline_inserted_at"])
+        if preserve_inserted_at and "_pipeline_inserted_at" in df.columns else None
+    )
+    df = df.drop(columns=[c for c in _PIPELINE_META if c in df.columns])
+    data_cols = list(df.columns)
+    df["_row_checksum"] = (
+        df[data_cols]
+        .astype(str)
+        .apply(lambda r: hashlib.md5("|".join(r).encode("utf-8")).hexdigest(), axis=1)
+    )
+    df.insert(0, "_pipeline_inserted_at", preserved_inserted_at if preserved_inserted_at is not None else now)
+    df.insert(1, "_pipeline_run_id",      run_id)
+    df.insert(2, "_source_file",          file_name)
+    df.insert(3, "_file_checksum",        checksum)
+    df.insert(4, "_loaded_at",            now)
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — Ingest  →  raw schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sense_file_fn(**ctx):
+    src   = CONFIG["source"]
+    match = _find_file(src["watch_path"], src["file_name"])
+    if match:
+        ctx["ti"].xcom_push(key="matched_file", value=match)
+        logging.info("[ingest.sense_file] Found: %s", match)
+        return True
+    logging.info("[ingest.sense_file] '%s' not in '%s' — retrying.", src["file_name"], src["watch_path"])
+    return False
+
+
+def compute_checksum(**ctx):
+    file_path = ctx["ti"].xcom_pull(task_ids="ingest.sense_file", key="matched_file")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"[ingest.compute_checksum] File not found: {file_path}")
+    checksum  = _compute_md5(file_path)
+    file_size = os.path.getsize(file_path)
+    ctx["ti"].xcom_push(key="checksum",  value=checksum)
+    ctx["ti"].xcom_push(key="file_size", value=file_size)
+    logging.info("[ingest.compute_checksum] MD5=%s size=%d", checksum, file_size)
+
+
+def load_to_raw(**ctx):
+    """Append source (file or DB) as-is into the permanent raw table.
+
+    Raw is never truncated — every run's batch is appended, tagged with
+    this run's _pipeline_run_id, so raw accumulates as a permanent record
+    of everything ever ingested. pipeline.file_load_registry's checksum
+    dedup (below) still prevents literally re-appending an identical file.
+    """
+    import pandas as pd
+    from sqlalchemy import text
+
+    ti      = ctx["ti"]
+    run_id  = ctx["dag_run"].run_id
+    src     = CONFIG["source"]
+    raw     = CONFIG["raw"]
+    engine  = _get_engine(raw["conn_id"])
+
+    _ensure_schema(raw["conn_id"], raw["schema"])
+
+    if IS_FILE_SRC:
+        file_path = ti.xcom_pull(task_ids="ingest.sense_file",       key="matched_file")
+        checksum  = ti.xcom_pull(task_ids="ingest.compute_checksum", key="checksum")
+        file_name = Path(file_path).name
+
+        if _checksum_registered(raw["schema"], raw["table"], checksum):
+            logging.info("[ingest.load_to_raw] Checksum already loaded — skipping.")
+            ti.xcom_push(key="rows_loaded", value=0)
+            ti.xcom_push(key="skipped",     value=True)
+            return
+
+        df = _read_file(src, file_path)
+        # Raw is a landing zone — keep every column as text, no type coercion.
+        # _cast_types is intentionally NOT called here; types are enforced in refine.
+    elif IS_API_SRC:
+        run_hwm_value = get_last_loaded_value()
+        records = fetch_api_pages(src, run_hwm_value)
+
+        if not records:
+            logging.info("[ingest.load_to_raw] No records returned from API.")
+            ti.xcom_push(key="rows_loaded", value=0)
+            ti.xcom_push(key="skipped",     value=False)
+            return
+
+        df = pd.json_normalize(records)
+        # Raw is a landing zone — keep every column as text, no type coercion
+        # (same treatment as the DB branch below); types are enforced in refine.
+        for col in df.columns:
+            df[col] = df[col].where(df[col].isna(), df[col].astype(str))
+        df.columns = [_clean_col(c) for c in df.columns]
+        checksum  = hashlib.md5(run_id.encode()).hexdigest()
+        file_name = None
+    else:
+        from modules.import_modules import parse_sql_file
+        from modules.utils import get_hook
+        from sqlalchemy import create_engine as _ce
+
+        sql_base  = Variable.get("sql_path", default_var=os.path.join(os.getcwd(), "dags", "sql"))
+        sql_file  = src.get("sql_file")
+        sql_path  = os.path.join(sql_base, sql_file) if sql_file else None
+        src_hook  = get_hook(src["source_db_conn_id"])
+        src_eng   = _ce(src_hook.get_uri())
+        base_sql  = parse_sql_file(sql_path)
+        chunks    = []
+        with src_eng.connect() as conn:
+            for chunk in pd.read_sql(text(base_sql), conn, chunksize=CONFIG["read_chunk_size"]):
+                chunks.append(chunk)
+        df        = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
+        # Cast all DB source columns to text for the raw landing table.
+        for col in df.columns:
+            df[col] = df[col].where(df[col].isna(), df[col].astype(str))
+        checksum  = hashlib.md5(run_id.encode()).hexdigest()
+        file_name = None
+
+    if df.empty:
+        logging.info("[ingest.load_to_raw] No rows from source.")
+        ti.xcom_push(key="rows_loaded", value=0)
+        ti.xcom_push(key="skipped",     value=False)
+        return
+
+    df = _add_meta(df, run_id, file_name=file_name, checksum=checksum)
+
+    # Collapse duplicates WITHIN this batch first. The staged
+    # insert-where-not-exists below only compares against rows already in
+    # raw, so two identical rows arriving together would both pass it and
+    # both land. That is not hypothetical: offset/limit pagination over a
+    # dataset that shifts mid-pull returns overlapping pages, and a rolling
+    # export can repeat records inside one file. Every row in a batch shares
+    # one _file_checksum, so collapsing on _row_checksum here is exactly the
+    # File-source (checksum + provenance) rule applied within the batch.
+    before = len(df)
+    df = df.drop_duplicates(subset=["_row_checksum"], keep="first")
+    if len(df) < before:
+        logging.info("[ingest.load_to_raw] %d duplicate row(s) within this batch collapsed.",
+                     before - len(df))
+
+    _ensure_table_from_df(df, raw["conn_id"], raw["schema"], raw["table"])
+
+    # Row-level dedup on append, not just the file-level checksum-registry
+    # gate above — that only catches literally re-uploading an identical
+    # file. Two different files can still share overlapping rows (e.g. a
+    # rolling export that re-includes prior records); since raw is
+    # permanent now, appending those again would grow it unnecessarily and
+    # would also let true duplicates slip into a batch un-deduped (target's
+    # own WHERE NOT EXISTS only checks against what's already IN target,
+    # not against sibling rows newly arriving in the same batch). Stage and
+    # insert-where-not-exists here, exactly like target already does — for
+    # File sources, matched on data + provenance (_row_checksum AND
+    # _file_checksum), not data alone: raw is meant to be a faithful record
+    # of everything ever ingested, and the same row showing up again in a
+    # genuinely different file is a real, distinct ingest event worth
+    # keeping (its own _source_file/_file_checksum), not something to
+    # silently drop.
+    #
+    # For API/DB sources there is no "file" — _file_checksum is md5(run_id),
+    # unique by construction on every run — so ANDing it in here would never
+    # match across runs and raw would double on every re-trigger of the same
+    # unchanged data. _row_checksum alone (already a content hash of every
+    # data column, from _add_meta) is the right and sufficient dedup key for
+    # these two source types; there's no provenance dimension to preserve.
+    _ensure_schema(raw["conn_id"], "etl_stg")
+    tmp = f"_tmp_raw_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+    df.head(0).to_sql(tmp, schema="etl_stg", con=engine, if_exists="replace", index=False)
+    _pg_copy_df(df, "etl_stg", tmp, engine)
+
+    dedup_clause = (
+        "r._row_checksum = t._row_checksum AND r._file_checksum IS NOT DISTINCT FROM t._file_checksum"
+        if IS_FILE_SRC else
+        "r._row_checksum = t._row_checksum"
+    )
+    cols = ", ".join(f'"{c}"' for c in df.columns)
+    with engine.begin() as conn:
+        result = conn.execute(text(f"""
+            INSERT INTO "{raw["schema"]}"."{raw["table"]}" ({cols})
+            SELECT {cols} FROM "etl_stg"."{tmp}" t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{raw["schema"]}"."{raw["table"]}" r
+                WHERE {dedup_clause}
+            )
+        """))
+        rows = result.rowcount
+        conn.execute(text(f'DROP TABLE IF EXISTS "etl_stg"."{tmp}"'))
+
+    logging.info("[ingest.load_to_raw] %d/%d rows were new (%d duplicate rows skipped)",
+                 rows, len(df), len(df) - rows)
+    ti.xcom_push(key="rows_loaded", value=rows)
+    ti.xcom_push(key="skipped",     value=False)
+    ti.xcom_push(key="file_name",   value=file_name)
+    ti.xcom_push(key="checksum",    value=checksum)
+    logging.info("[ingest.load_to_raw] %d rows → %s.%s", rows, raw["schema"], raw["table"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — Refine  →  refined schema
+# If "cleaning" is null in config this is a straight copy (no transforms).
+# If "cleaning" is set, SQL queries and/or Python functions are applied first.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _refine_watermark(tgt):
+    """MAX(_pipeline_inserted_at) already present in the target table — the
+    newest raw-ingest-time among rows that have actually made it all the way
+    through to target. Returns None if the target doesn't exist yet or is
+    empty (first-ever run: nothing to compare against, process all of raw).
+    Pipeline-internal and source-type-agnostic — works the same for File,
+    DB, and API sources, no source-side incrementing column needed.
+
+    Known boundary: the comparison downstream is strictly greater-than, so a
+    raw row stamped at EXACTLY this value but never loaded would not be
+    picked up. That needs two separate ingest batches sharing one microsecond
+    — _add_meta stamps a single utcnow() across a whole batch, and a batch
+    reaches target all-or-nothing via one INSERT, so in normal operation the
+    watermark only ever equals a batch that fully landed. It is reachable by
+    hand-inserting into raw, and a reload run (dag_run.conf {"reload": true})
+    recovers it. Using >= instead would re-refine the newest batch on every
+    single run, which is precisely the cost this watermark exists to avoid.
+    """
+    from sqlalchemy import text
+    try:
+        tgt_engine = _get_engine(tgt["target_db_conn_id"])
+        with tgt_engine.connect() as conn:
+            return conn.execute(text(
+                f'SELECT MAX("_pipeline_inserted_at") FROM "{tgt["target_schema"]}"."{tgt["target_table"]}"'
+            )).scalar()
+    except Exception as exc:
+        logging.info("[refine.refine_data] No usable watermark from target yet (%s) — processing all of raw.", exc)
+        return None
+
+
+def refine_data(**ctx):
+    """Copy raw's unprocessed backlog → refined, optionally applying cleaning.
+
+    Scope of the raw→refined copy:
+      - Normal run: only raw rows newer than the watermark — the newest
+        _pipeline_inserted_at already present in target (see
+        _refine_watermark()). This is deliberately NOT scoped to just this
+        run's own _pipeline_run_id: if an earlier run's ingest succeeded but
+        refine/dw_load then failed, that batch is stranded in raw with an
+        older run_id, and run_id-scoping would never go back for it. Scoping
+        by "newer than what's already fully in target" instead makes this
+        self-healing — the next successful run always sweeps up any
+        backlog automatically, regardless of which run originally ingested
+        it, with no manual backfill ever needed. Cost still stays
+        independent of how large raw has grown over time, same as before.
+      - Reload run (dag_run.conf == {"reload": true}): the ENTIRE raw
+        table, unscoped — used to rebuild target from everything ever
+        ingested without needing the original source file(s) again.
+
+    Cleaning now runs against REFINED, never against raw. Raw must stay an
+    untouched, permanent copy of exactly what was ingested — mutating it in
+    place would both defeat the point of keeping it permanently (it would
+    no longer reflect the original ingest) and make refine's cost grow with
+    raw's total size instead of just the current batch.
+
+    cleaning.sql_queries : list of SQL strings run against the refined table.
+    cleaning.script_path : path to a Python cleaning module (relative to
+                           the Airflow Variable  cleaning_files_path).
+    cleaning.functions   : list of function names in that module to call
+                           in order.  Each function receives keyword args
+                           (engine, schema, table) so it can operate on the
+                           transit table instead of a hardcoded source table.
+    """
+    import pandas as pd
+    from sqlalchemy import text
+
+    ti      = ctx["ti"]
+    run_id  = ctx["dag_run"].run_id
+    reload  = bool((ctx["dag_run"].conf or {}).get("reload"))
+    raw     = CONFIG["raw"]
+    refined = CONFIG["refined"]
+    tgt     = CONFIG["target"]
+    cleaning = CONFIG.get("cleaning")
+    engine  = _get_engine(raw["conn_id"])
+
+    _ensure_schema(refined["conn_id"], refined["schema"])
+
+    # Raw may legitimately not exist yet: ingest skips creating it when it
+    # has nothing to load — a file whose checksum is already in
+    # file_load_registry, or an API/DB source that returned no rows — and on
+    # a first run there is no earlier batch to have created it either. That
+    # is "nothing to refine", not a failure; without this guard the CREATE
+    # TABLE AS SELECT below dies on UndefinedTable and fails the whole DAG.
+    with engine.connect() as conn:
+        raw_exists = conn.execute(text(
+            "SELECT to_regclass(:qualified)"
+        ), {"qualified": f'{raw["schema"]}.{raw["table"]}'}).scalar() is not None
+    if not raw_exists:
+        logging.info("[refine.refine_data] Raw table %s.%s does not exist yet — nothing to refine.",
+                     raw["schema"], raw["table"])
+        ti.xcom_push(key="rows_refined", value=0)
+        return
+
+    # ── Phase 1: land the unprocessed backlog (or all of raw, on reload)
+    #    into refined as-is — still TEXT, untyped, unclean. Raw and refined
+    #    are always on the same DB connection, so this is one plain SQL
+    #    CREATE TABLE AS SELECT — no reason to round-trip 3000+ rows
+    #    through a pandas DataFrame just to copy them from one schema to
+    #    another on the same server; let Postgres do it directly. ──────────
+    if reload:
+        scope_clause, params = '', {}
+    else:
+        watermark = _refine_watermark(tgt)
+        if watermark is None:
+            scope_clause, params = '', {}
+        else:
+            # Raw stores every column — including this one — as TEXT (it's
+            # written before _cast_types ever runs); the watermark itself
+            # comes back from target as a real typed value. An explicit
+            # cast is required or Postgres rejects "text > timestamp"
+            # outright with no implicit comparison operator.
+            scope_clause = ' WHERE "_pipeline_inserted_at"::timestamp > :watermark'
+            params = {"watermark": watermark}
+    ref_engine = _get_engine(refined["conn_id"])
+    with engine.begin() as conn:
+        conn.execute(text(f'DROP TABLE IF EXISTS "{refined["schema"]}"."{refined["table"]}"'))
+        conn.execute(text(f"""
+            CREATE TABLE "{refined["schema"]}"."{refined["table"]}" AS
+            SELECT * FROM "{raw["schema"]}"."{raw["table"]}"{scope_clause}
+        """), params)
+        rows_landed = conn.execute(text(
+            f'SELECT COUNT(*) FROM "{refined["schema"]}"."{refined["table"]}"'
+        )).scalar()
+
+    if not rows_landed:
+        logging.info(
+            "[refine.refine_data] No rows in scope (reload=%s) — nothing to refine.",
+            reload,
+        )
+        ti.xcom_push(key="rows_refined", value=0)
+        return
+
+    # ── SQL cleaning queries run against refined ─────────────────────────
+    if cleaning:
+        sql_queries = cleaning.get("sql_queries") or []
+        for q in sql_queries:
+            logging.info("[refine.refine_data] SQL clean: %.120s", q)
+            with ref_engine.begin() as conn:
+                conn.execute(text(q))
+
+        # ── Python cleaning script functions ─────────────────────────────
+        script_path = cleaning.get("script_path")
+        functions   = cleaning.get("functions") or []
+        if script_path and functions:
+            cleaning_base = Variable.get(
+                "cleaning_files_path",
+                default_var=os.path.join(os.getcwd(), "cleaning_files"),
+            )
+            full_path = (
+                script_path if os.path.isabs(script_path)
+                else os.path.join(cleaning_base, script_path)
+            )
+            spec   = importlib.util.spec_from_file_location("_hybrid_cleaning", full_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            for fn_name in functions:
+                fn = getattr(module, fn_name, None)
+                if fn is None:
+                    logging.warning("[refine.refine_data] '%s' not found in %s — skipping.", fn_name, script_path)
+                    continue
+                logging.info("[refine.refine_data] Calling cleaning function: %s", fn_name)
+                fn(engine=ref_engine, schema=refined["schema"], table=refined["table"])
+
+    # ── Phase 2: read back (now-cleaned) refined rows, apply type casts,
+    #    rewrite refined typed ────────────────────────────────────────────
+    with ref_engine.connect() as conn:
+        df = pd.read_sql(
+            text(f'SELECT * FROM "{refined["schema"]}"."{refined["table"]}"'),
+            conn,
+        )
+
+    # Apply dtype_overrides (integer, timestamp, date, etc.) and date format hints.
+    src = CONFIG["source"]
+    df = _cast_types(df, src)
+
+    # Recreate refined table each run — enforces correct column types from pandas dtypes
+    # (using to_sql so SQLAlchemy maps Int64→BIGINT, datetime64→TIMESTAMP, etc.)
+    df.head(0).to_sql(refined["table"], schema=refined["schema"], con=ref_engine, if_exists="replace", index=False)
+    _pg_copy_df(df, refined["schema"], refined["table"], ref_engine)
+    ti.xcom_push(key="rows_refined", value=len(df))
+    logging.info("[refine.refine_data] %d rows → %s.%s (reload=%s)",
+                 len(df), refined["schema"], refined["table"], reload)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 3 — DW Load  ←  always reads from refined schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_to_dw(**ctx):
+    """Read from refined schema and load into the DW target table.
+
+    DW always reads from refined — this is consistent whether or not
+    cleaning was applied in Stage 2.  Deduplication is by _row_checksum
+    so reruns never double-insert the same rows.
+    """
+    import pandas as pd
+    from sqlalchemy import text
+
+    ti      = ctx["ti"]
+    run_id  = ctx["dag_run"].run_id
+    refined = CONFIG["refined"]
+    tgt     = CONFIG["target"]
+    now     = datetime.utcnow()
+
+    # refine_data only rewrites refined when it has rows in scope — if this
+    # run found nothing new, refined still holds whatever the last run left
+    # behind (it's no longer implicitly emptied between runs), so a plain
+    # "is refined empty" check can't detect a no-op run. Trust refine_data's
+    # own count instead.
+    rows_refined = ti.xcom_pull(task_ids="refine.refine_data", key="rows_refined")
+    if not rows_refined:
+        logging.info("[dw_load.load_to_dw] Nothing to load (refine processed 0 rows).")
+        ti.xcom_push(key="rows_loaded_dw", value=0)
+        return
+
+    ref_engine = _get_engine(refined["conn_id"])
+    dw_engine  = _get_engine(tgt["target_db_conn_id"])
+
+    with ref_engine.connect() as conn:
+        df = pd.read_sql(
+            text(f'SELECT * FROM "{refined["schema"]}"."{refined["table"]}"'),
+            conn,
+        )
+
+    if df.empty:
+        logging.info("[dw_load.load_to_dw] Refined table empty — nothing to load to DW.")
+        ti.xcom_push(key="rows_loaded_dw", value=0)
+        return
+
+    # Drop pipeline meta columns — they stay in raw/refined, not in DW —
+    # EXCEPT _pipeline_inserted_at, which _add_meta() preserves rather than
+    # re-stamps: it needs to survive into target unchanged as the original
+    # raw-ingest timestamp, so refine_data() can use MAX(_pipeline_inserted_at)
+    # from target as a watermark on the next run (see _add_meta's docstring).
+    df = df.drop(columns=[c for c in _PIPELINE_META if c != "_pipeline_inserted_at" and c in df.columns])
+
+    # Re-add DW-side pipeline metadata (_pipeline_inserted_at carried through as-is)
+    df = _add_meta(df, run_id, preserve_inserted_at=True)
+
+    dw_schema = tgt["target_schema"]
+    dw_table  = tgt["target_table"]
+
+    _ensure_schema(tgt["target_db_conn_id"], dw_schema)
+    _ensure_schema(tgt["target_db_conn_id"], "etl_stg")
+
+    # Stage into etl_stg — staging table gets correct column types from pandas dtypes
+    tmp = f"_tmp_hybrid_{hashlib.md5(run_id.encode()).hexdigest()[:8]}"
+    df.head(0).to_sql(tmp, schema="etl_stg", con=dw_engine, if_exists="replace", index=False)
+    _pg_copy_df(df, "etl_stg", tmp, dw_engine)
+
+    cols = ", ".join(f'"{c}"' for c in df.columns)
+
+    # Auto-create target table from staging structure (inherits correct column types)
+    if CONFIG.get("create_dw_table_if_not_exists", True):
+        with dw_engine.begin() as conn:
+            conn.execute(text(f"""
+                CREATE TABLE IF NOT EXISTS "{dw_schema}"."{dw_table}" AS
+                SELECT {cols} FROM "etl_stg"."{tmp}" WHERE 1=0
+            """))
+
+    # Self-heal: a target table that already existed before this pipeline
+    # started writing to it (created by another job/process, or by an older
+    # version of this template) won't have the pipeline meta columns the
+    # INSERT below requires. Add whatever's missing so every DW table stays
+    # interchangeable across jobs regardless of how/when it was created.
+    with dw_engine.begin() as conn:
+        for col, col_type in _META_COL_TYPES.items():
+            conn.execute(text(
+                f'ALTER TABLE "{dw_schema}"."{dw_table}" '
+                f'ADD COLUMN IF NOT EXISTS "{col}" {col_type}'
+            ))
+
+    # Self-heal: a source (API/file/DB) can start returning fields that
+    # didn't exist when the target table was first created — auto-add
+    # whatever's missing (typed from the staging table, which pandas.to_sql
+    # already gave correct types) rather than failing the whole load.
+    # Existing rows get NULL in the new column; columns the target has that
+    # the source doesn't are simply left out of the INSERT below and keep
+    # whatever they already had (also NULL for newly-inserted rows).
+    with dw_engine.begin() as conn:
+        existing_cols = {
+            row[0] for row in conn.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = :s AND table_name = :t"
+            ), {"s": dw_schema, "t": dw_table})
+        }
+        staging_types = {
+            row[0]: row[1] for row in conn.execute(text(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_schema = 'etl_stg' AND table_name = :t"
+            ), {"t": tmp})
+        }
+        for col in df.columns:
+            if col not in existing_cols:
+                conn.execute(text(
+                    f'ALTER TABLE "{dw_schema}"."{dw_table}" '
+                    f'ADD COLUMN IF NOT EXISTS "{col}" {staging_types.get(col, "text")}'
+                ))
+
+    with dw_engine.begin() as conn:
+        result = conn.execute(text(f"""
+            INSERT INTO "{dw_schema}"."{dw_table}" ({cols})
+            SELECT {cols} FROM "etl_stg"."{tmp}" t
+            WHERE NOT EXISTS (
+                SELECT 1 FROM "{dw_schema}"."{dw_table}" r
+                WHERE r._row_checksum = t._row_checksum
+            )
+        """))
+        conn.execute(text(f'DROP TABLE IF EXISTS "etl_stg"."{tmp}"'))
+        rows_loaded = result.rowcount
+
+    ti.xcom_push(key="rows_loaded_dw", value=rows_loaded)
+    logging.info(
+        "[dw_load.load_to_dw] Inserted %d rows → %s.%s",
+        rows_loaded, dw_schema, dw_table,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cleanup — only after all three stages succeed
+# ─────────────────────────────────────────────────────────────────────────────
+
+def truncate_refined(**ctx):
+    from sqlalchemy import text
+    refined = CONFIG["refined"]
+    engine  = _get_engine(refined["conn_id"])
+    with engine.begin() as conn:
+        conn.execute(text(f'TRUNCATE TABLE "{refined["schema"]}"."{refined["table"]}"'))
+    logging.info("[cleanup.truncate_refined] Truncated %s.%s", refined["schema"], refined["table"])
+
+
+def archive_file(**ctx):
+    ti        = ctx["ti"]
+    src       = CONFIG["source"]
+    file_path = ti.xcom_pull(task_ids="ingest.sense_file", key="matched_file")
+    if not file_path or not os.path.exists(file_path):
+        logging.warning("[cleanup.archive_file] No file to archive.")
+        ti.xcom_push(key="archived_to", value=None)
+        return
+    archive_dir = src["archive_path"]
+    os.makedirs(archive_dir, exist_ok=True)
+    p    = Path(file_path)
+    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(archive_dir, f"{p.stem}_{ts}{p.suffix}")
+    shutil.copy2(file_path, dest)
+    os.utime(dest, None)
+    if os.path.getsize(dest) != os.path.getsize(file_path):
+        raise ValueError(
+            f"[cleanup.archive_file] Size mismatch after copy: "
+            f"src={os.path.getsize(file_path)} dest={os.path.getsize(dest)}"
+        )
+    os.remove(file_path)
+    logging.info("[cleanup.archive_file] Archived %s → %s", file_path, dest)
+    ti.xcom_push(key="archived_to", value=dest)
+
+
+def cleanup_archive(**ctx):
+    src            = CONFIG["source"]
+    archive_dir    = src["archive_path"]
+    retention_days = src["archive_retention_days"]
+    cutoff         = datetime.utcnow().timestamp() - retention_days * 86400
+    if not os.path.isdir(archive_dir):
+        return
+    deleted = 0
+    for fname in os.listdir(archive_dir):
+        fpath = os.path.join(archive_dir, fname)
+        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+            os.remove(fpath)
+            deleted += 1
+    logging.info("[cleanup.cleanup_archive] Removed %d files older than %d days.", deleted, retention_days)
+
+
+def register_load(**ctx):
+    """Write to pipeline.file_load_registry after a successful file ingest."""
+    from sqlalchemy import text
+    if not IS_FILE_SRC:
+        return
+    ti          = ctx["ti"]
+    run_id      = ctx["dag_run"].run_id
+    raw         = CONFIG["raw"]
+    file_name   = ti.xcom_pull(task_ids="ingest.load_to_raw",       key="file_name")
+    checksum    = ti.xcom_pull(task_ids="ingest.load_to_raw",       key="checksum")
+    file_size   = ti.xcom_pull(task_ids="ingest.compute_checksum",  key="file_size") or 0
+    rows_loaded = ti.xcom_pull(task_ids="ingest.load_to_raw",       key="rows_loaded") or 0
+    archived_to = ti.xcom_pull(task_ids="cleanup.archive_file",     key="archived_to")
+
+    if not checksum:
+        # Reload runs bypass ingest entirely, so there's no new file/checksum
+        # to register. Without this guard every reload would insert a junk
+        # NULL-checksum row (Postgres treats each NULL as distinct under the
+        # unique constraint, so they wouldn't even dedupe against each other).
+        logging.info("[cleanup.register_load] No new file this run (reload) — skipping registry insert.")
+        return
+
+    engine      = _get_engine(raw["conn_id"])
+    with engine.begin() as conn:
+        _ensure_registry_table(conn)
+        conn.execute(text("""
+            INSERT INTO pipeline.file_load_registry (
+                dag_id, target_schema, target_table, file_name, file_path,
+                file_checksum, file_size_bytes, rows_loaded, run_id,
+                loaded_at, archived_to, archived_at
+            ) VALUES (
+                :dag_id, :schema, :table, :file_name, :file_name,
+                :checksum, :file_size, :rows_loaded, :run_id,
+                NOW(), :archived_to,
+                CASE WHEN :archived_to2 IS NOT NULL THEN NOW() ELSE NULL END
+            )
+            ON CONFLICT (target_schema, target_table, file_checksum) DO NOTHING
+        """), {
+            "dag_id":      CONFIG["dag_id"],
+            "schema":      raw["schema"],
+            "table":       raw["table"],
+            "file_name":   file_name,
+            "checksum":    checksum,
+            "file_size":   file_size,
+            "rows_loaded": rows_loaded,
+            "run_id":      run_id,
+            "archived_to": archived_to,
+            "archived_to2": archived_to,
+        })
+    logging.info("[cleanup.register_load] Registry updated for %s", file_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _target_metrics(engine, schema, table):
+    """Row counts and load-recency read straight from the target table's own
+    _loaded_at meta column, which every row gets stamped with at dw_load
+    time regardless of source type.
+
+    This is what lets a file/DB/API job report the same freshness numbers a
+    DB-source pipeline gets from its incremental_column: there is no
+    business date to key off here, but "when did this pipeline write the
+    row" is always known. Without it these columns sit NULL in
+    pipeline.etl_metrics and the dashboard reports 0 rows loaded today for
+    a table that in fact loaded thousands.
+
+    Degrades in two steps rather than failing the run: a target predating
+    the pipeline meta columns still yields a total, and a target that does
+    not exist yet yields zeros.
+    """
+    from sqlalchemy import text
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text(f"""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE "_loaded_at" >= date_trunc('day', now())),
+                       MAX("_loaded_at"),
+                       MIN("_loaded_at")
+                FROM "{schema}"."{table}"
+            """)).fetchone()
+        return {"total": row[0] or 0, "today": row[1] or 0,
+                "max_loaded": row[2], "first_loaded": row[3]}
+    except Exception as exc:
+        logging.info("[collect_metrics] No _loaded_at on %s.%s (%s) — falling back to a plain count.",
+                     schema, table, exc)
+    try:
+        with engine.connect() as conn:
+            total = conn.execute(text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')).scalar() or 0
+        return {"total": total, "today": None, "max_loaded": None, "first_loaded": None}
+    except Exception:
+        return {"total": 0, "today": None, "max_loaded": None, "first_loaded": None}
+
+
+def collect_metrics_fn(**ctx):
+    from sqlalchemy import text
+    from airflow.utils import timezone
+
+    ti        = ctx["ti"]
+    dag_run   = ctx["dag_run"]
+    env       = Variable.get("environment", "dev")
+    run_id    = dag_run.run_id
+    run_start = dag_run.start_date
+    run_end   = timezone.utcnow()
+    duration  = int((run_end - run_start).total_seconds()) if run_start else None
+
+    rows_raw = ti.xcom_pull(task_ids="ingest.load_to_raw",    key="rows_loaded") or 0
+    rows_dw  = ti.xcom_pull(task_ids="dw_load.load_to_dw",   key="rows_loaded_dw") or 0
+
+    tgt    = CONFIG["target"]
+    engine = _get_engine(tgt["target_db_conn_id"])
+    schema = tgt["target_schema"]
+    table  = tgt["target_table"]
+
+    # Ensure metrics table exists
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id                   SERIAL PRIMARY KEY,
+                dag_id               TEXT,
+                env                  TEXT,
+                schema               TEXT,
+                table_name           TEXT,
+                run_id               TEXT,
+                run_start            TIMESTAMP WITH TIME ZONE,
+                run_end              TIMESTAMP WITH TIME ZONE,
+                run_duration_secs    INTEGER,
+                run_status           TEXT NOT NULL DEFAULT 'success',
+                error_msg            TEXT,
+                batch_size           INTEGER,
+                rows_loaded_now      BIGINT,
+                target_total_records BIGINT,
+                created_at           TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type          TEXT DEFAULT 'pandas',
+                source_type          TEXT DEFAULT 'hybrid'
+            )
+        """))
+        # pipeline.etl_metrics is shared across every pipeline_type (hybrid,
+        # file, db, spark) — whichever one's collect_metrics runs first
+        # creates the table with only its own column set. Every template
+        # must ALTER-ADD the full canonical set here too, or a dashboard
+        # querying columns another pipeline_type populates (e.g. perc_loaded,
+        # target_max_incremental) fails outright once this table happens to
+        # get created by a hybrid/file run first instead of a db run.
+        for m in [
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'hybrid'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_today_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_first_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_total_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_loaded_to_max_target BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS perc_loaded NUMERIC(6,2)",
+        ]:
+            conn.execute(text(m))
+
+    # Count rows in a separate connection — if the target table doesn't exist this
+    # SELECT would abort the transaction and prevent the metrics INSERT from running.
+    tgt_metrics = _target_metrics(engine, schema, table)
+    target_total = tgt_metrics["total"]
+
+    # Raw is now permanent/append-only and holds the full ingested history for
+    # this job, so it's the natural "source total" for a hybrid job (there is
+    # no separate upstream system to count against, unlike DB-source pipelines).
+    # Raw may live on a different connection than target (raw["conn_id"] vs.
+    # tgt["target_db_conn_id"]), so use its own engine rather than assuming
+    # they're the same database.
+    raw = CONFIG["raw"]
+    try:
+        raw_engine = _get_engine(raw["conn_id"])
+        with raw_engine.connect() as conn:
+            source_total = conn.execute(
+                text(f'SELECT COUNT(*) FROM "{raw["schema"]}"."{raw["table"]}"')
+            ).scalar() or 0
+    except Exception:
+        source_total = None
+
+    with engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status,
+                rows_loaded_now, target_total_records, target_today_records,
+                target_max_upload_date, target_first_upload_date,
+                source_total_records, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table, :run_id,
+                :run_start, :run_end, :duration, 'success',
+                :rows_dw, :target_total, :target_today,
+                :target_max_upload, :target_first_upload,
+                :source_total, 'pandas', 'hybrid'
+            )
+        """), {
+            "dag_id":              CONFIG["dag_id"],
+            "env":                 env,
+            "schema":              schema,
+            "table":               table,
+            "run_id":              run_id,
+            "run_start":           run_start,
+            "run_end":             run_end,
+            "duration":            duration,
+            "rows_dw":             rows_dw,
+            "target_total":        target_total,
+            "target_today":        tgt_metrics["today"],
+            "target_max_upload":   tgt_metrics["max_loaded"],
+            "target_first_upload": tgt_metrics["first_loaded"],
+            "source_total":        source_total,
+        })
+    logging.info(
+        "[collect_metrics] rows_raw=%d rows_dw=%d source_total=%s target_total=%d target_today=%s",
+        rows_raw, rows_dw, source_total, target_total, tgt_metrics["today"],
+    )
+
+
+def collect_error_metrics_fn(**ctx):
+    from sqlalchemy import text
+    from airflow.utils import timezone
+    dag_run   = ctx.get("dag_run")
+    now       = timezone.utcnow()
+    run_start = getattr(dag_run, "start_date", now)
+    duration  = int((now - run_start).total_seconds()) if run_start else 0
+    error_msg = str(ctx.get("exception", "Unknown error"))[:2000]
+    tgt       = CONFIG["target"]
+    engine    = _get_engine(tgt["target_db_conn_id"])
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id SERIAL PRIMARY KEY, dag_id TEXT, env TEXT, schema TEXT,
+                table_name TEXT, run_id TEXT,
+                run_start TIMESTAMP WITH TIME ZONE, run_end TIMESTAMP WITH TIME ZONE,
+                run_duration_secs INTEGER, run_status TEXT NOT NULL DEFAULT 'success',
+                error_msg TEXT, batch_size INTEGER, rows_loaded_now BIGINT,
+                target_total_records BIGINT, created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type TEXT DEFAULT 'pandas', source_type TEXT DEFAULT 'hybrid'
+            )
+        """))
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status, error_msg,
+                rows_loaded_now, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table, :run_id,
+                :run_start, :run_end, :duration, 'failed', :error_msg,
+                0, 'pandas', 'hybrid'
+            )
+        """), {
+            "dag_id":    CONFIG["dag_id"],
+            "env":       Variable.get("environment", "dev"),
+            "schema":    tgt["target_schema"],
+            "table":     tgt["target_table"],
+            "run_id":    ctx.get("run_id", ""),
+            "run_start": run_start,
+            "run_end":   now,
+            "duration":  duration,
+            "error_msg": error_msg,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAG definition
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_reload_fn(**ctx):
+    """Branch: on a reload run, skip ingest entirely and go straight to
+    refine (which will read ALL of raw, unscoped, instead of just this
+    run's batch). A reload has no new file involved — letting the
+    file-source sensor run would block for up to 24h waiting for a file
+    that isn't coming.
+    """
+    reload = bool((ctx["dag_run"].conf or {}).get("reload"))
+    if reload:
+        return "refine.refine_data"
+    return "ingest.sense_file" if IS_FILE_SRC else "ingest.load_to_raw"
+
+
+default_args = {
+    "owner":           "airflow",
+    "depends_on_past": False,
+    "retries":         1,
+    "retry_delay":     timedelta(minutes=5),
+    "on_failure_callback": lambda ctx: collect_error_metrics_fn(**ctx),
+}
+
+with DAG(
+    dag_id=CONFIG["dag_id"],
+    default_args=default_args,
+    schedule_interval=CONFIG["schedule_interval"],
+    start_date=datetime.strptime(CONFIG["start_date"], "%Y-%m-%d"),
+    catchup=False,
+    max_active_runs=1,
+    tags=CONFIG["tags"],
+    params={"reload": False},
+    description=(
+        f"Hybrid — {'file' if IS_FILE_SRC else ('api' if IS_API_SRC else 'db')} → "
+        f"{CONFIG['raw']['schema']}.{CONFIG['raw']['table']} → "
+        f"{'clean → ' if HAS_CLEANING else ''}"
+        f"{CONFIG['refined']['schema']}.{CONFIG['refined']['table']} → "
+        f"{CONFIG['target']['target_schema']}.{CONFIG['target']['target_table']}"
+    ),
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+    end   = EmptyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+
+    check_reload = BranchPythonOperator(
+        task_id="check_reload",
+        python_callable=check_reload_fn,
+    )
+
+    # ── Stage 1: Ingest ──────────────────────────────────────────────────
+    with TaskGroup("ingest") as ingest_group:
+        if IS_FILE_SRC:
+            sense_task = PythonSensor(
+                task_id="sense_file",
+                python_callable=sense_file_fn,
+                poke_interval=60,
+                timeout=86400,
+                mode="reschedule",
+                soft_fail=True,
+            )
+            checksum_task = PythonOperator(
+                task_id="compute_checksum",
+                python_callable=compute_checksum,
+            )
+            raw_task = PythonOperator(
+                task_id="load_to_raw",
+                python_callable=load_to_raw,
+            )
+            sense_task >> checksum_task >> raw_task
+        else:
+            raw_task = PythonOperator(
+                task_id="load_to_raw",
+                python_callable=load_to_raw,
+            )
+
+    # ── Stage 2: Refine ──────────────────────────────────────────────────
+    # Always runs: copies raw's scoped batch → refined, applying cleaning
+    # config if present. trigger_rule=NONE_FAILED so this still fires when
+    # its ingest upstream was SKIPPED (the reload bypass path) rather than
+    # succeeded (the normal path) — either way is fine as long as nothing
+    # actually failed.
+    with TaskGroup("refine") as refine_group:
+        refine_task = PythonOperator(
+            task_id="refine_data",
+            python_callable=refine_data,
+            trigger_rule=TriggerRule.NONE_FAILED,
+        )
+
+    # ── Stage 3: DW Load ─────────────────────────────────────────────────
+    with TaskGroup("dw_load") as dw_load_group:
+        dw_task = PythonOperator(
+            task_id="load_to_dw",
+            python_callable=load_to_dw,
+        )
+
+    # ── Cleanup — only after all three stages succeed ─────────────────────
+    with TaskGroup("cleanup") as cleanup_group:
+        trunc_refined_task = PythonOperator(
+            task_id="truncate_refined",
+            python_callable=truncate_refined,
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+        register_task = PythonOperator(
+            task_id="register_load",
+            python_callable=register_load,
+            trigger_rule=TriggerRule.ALL_SUCCESS,
+        )
+        if IS_FILE_SRC:
+            archive_task = PythonOperator(
+                task_id="archive_file",
+                python_callable=archive_file,
+                trigger_rule=TriggerRule.ALL_SUCCESS,
+            )
+            cleanup_arch_task = PythonOperator(
+                task_id="cleanup_archive",
+                python_callable=cleanup_archive,
+                trigger_rule=TriggerRule.ALL_SUCCESS,
+            )
+            archive_task >> cleanup_arch_task
+
+    metrics_task = PythonOperator(
+        task_id="collect_metrics",
+        python_callable=collect_metrics_fn,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    # ── Wire: start → check_reload → [ingest → refine | refine (bypass)]
+    #         → dw_load → cleanup → metrics → end
+    start >> check_reload
+    check_reload >> ingest_group
+    check_reload >> refine_task
+    ingest_group >> refine_group >> dw_load_group >> cleanup_group >> metrics_task >> end

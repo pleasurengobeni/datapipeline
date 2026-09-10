@@ -1,0 +1,198 @@
+# Custom Falco rules for WASAC analytics pipeline
+# Focus: data exfiltration, privilege escalation, backdoor detection
+
+# ── Macros ────────────────────────────────────────────────────────────────────
+
+# Every container name prefix below was "datapipeline-*" until this fix —
+# confirmed concretely via `docker ps` that every real container is actually
+# "airflow-*" (airflow-airflow-scheduler-1, airflow-postgres-1, etc. — the
+# compose project name is "airflow", not "datapipeline"). That meant
+# every rule gated by these macros, plus "New user created in Postgres"
+# below, could never match anything and had zero real coverage since
+# whenever they were written.
+- macro: airflow_containers
+  condition: container.name startswith "airflow-airflow"
+
+- macro: data_containers
+  condition: >
+    container.name startswith "airflow-airflow" or
+    container.name startswith "airflow-web-ui" or
+    container.name startswith "airflow-analytics" or
+    container.name startswith "airflow-pipeline-monitor"
+
+- macro: known_outbound_data_tools
+  condition: >
+    proc.name in (python3, python, airflow, celery, gunicorn, flask, streamlit)
+
+# Destinations that pipeline workers legitimately reach.
+# The hostname-suffix clauses this macro used to have (fd.sip.name endswith
+# ".rds.amazonaws.com" etc.) crashed the whole Falco process the moment the
+# "Unexpected outbound connection from data container" rule actually
+# evaluated a real event — confirmed concretely: "Error: filter error:
+# fd.*ip.name filter only supports '=' and '!=' operators" (this version's
+# fd.*ip.name field rejects endswith/contains/glob outright, not just this
+# specific case). It stayed silently latent until the container-name-prefix
+# fix above made data_containers match anything for the first time; only
+# then did this rule start actually running and hit it. Left with the
+# port-based check plus fd.snet (a distinct field for CIDR-range
+# membership, not subject to the fd.*ip.name restriction above) for
+# internal container-to-container traffic — confirmed concretely as the
+# dominant remaining noise source once the DNS fix (see below) landed:
+# every container-to-container call on this stack's two docker-compose
+# bridge networks (airflow-net, backend-internal) showed up as
+# "unexpected" because the original allowlist only ever covered specific
+# external cloud DB hostnames, never this stack's own internal traffic.
+# docker-compose.yaml doesn't pin a fixed subnet for either network
+# (Docker auto-assigns), so this uses Docker's whole default private
+# range (172.16.0.0/12) rather than the two specific /16s currently
+# observed — robust to the subnet shifting if the networks get recreated.
+- macro: allowed_etl_destinations
+  condition: >
+    fd.sport in (5432, 3306, 1433, 1521, 6379) or
+    fd.snet in ("172.16.0.0/12")
+
+# Known-safe activity Falco's built-in "user_known_read_sensitive_files_
+# activities" macro exists specifically for this: overriding it here (this
+# file loads after falco_rules.yaml, so a later redefinition of the same
+# macro name replaces the built-in `(never_true)` default) narrows the
+# exception to exactly this one verified case, rather than weakening the
+# "Read sensitive file untrusted" rule for anything else, or exempting the
+# whole postgres image via the coarser user_read_sensitive_file_containers
+# mechanism. This is Docker's own healthcheck (docker-compose.yaml:
+# test: ["CMD", "pg_isready", "-U", "airflow"], every 5s) — confirmed via
+# the alert's own cmdline/timing match. proc.exepath showing /usr/bin/perl
+# instead of pg_isready's own binary is a known eBPF-probe attribution
+# quirk on short-lived processes, not pg_isready actually reading /etc/shadow.
+- macro: user_known_read_sensitive_files_activities
+  condition: >
+    (proc.name = "pg_isready" and
+     container.name = "airflow-postgres-1" and
+     fd.name = "/etc/shadow")
+
+# ── Data exfiltration rules ───────────────────────────────────────────────────
+
+- rule: Unexpected outbound connection from data container
+  desc: >
+    A data container opened a network connection to an unexpected destination.
+    Legitimate ETL connections go to known DB ports on known hostnames.
+  # 80/443 allowed for pip/apt during image build (not expected at runtime);
+  # fd.sip.name = "" covers unix sockets, which have no IP. 127.0.0.11 is
+  # Docker's own embedded DNS resolver (every container's /etc/resolv.conf
+  # points here) — confirmed concretely as the dominant source of noise
+  # once data_containers started matching real containers for the first
+  # time (19MB+ of alerts.log in under an hour, nearly all this). It's
+  # always the container's own loopback resolver, never an actual external
+  # destination, so exempting this one address doesn't open up real DNS
+  # exfiltration to external resolvers the way exempting port 53 broadly
+  # would. proc.cmdline exact-matches docker-compose.yaml's own webserver
+  # healthcheck (test: ["CMD", "curl", "--fail", "http://localhost:8080/
+  # health"]) — confirmed concretely, dest showed up as <NA>:<NA> (fd.sip
+  # not populated) rather than a loopback IP, a known eBPF-probe timing
+  # quirk on very fast localhost connections that fd.sip in (...) above
+  # can't catch since NULL never equals any listed value. Exact string
+  # match, not a broad "any null destination" allowance, since that could
+  # also hide a genuinely suspicious connection the probe just didn't
+  # finish resolving in time.
+  condition: >
+    evt.type = connect and evt.dir = < and
+    data_containers and
+    not (allowed_etl_destinations or
+         fd.sip in (127.0.0.1, 0.0.0.0, 127.0.0.11, ::1) or
+         fd.sport in (80, 443) or
+         fd.sip.name = "" or
+         proc.cmdline = "curl --fail http://localhost:8080/health")
+  output: >
+    Unexpected outbound from container
+    (container=%container.name proc=%proc.name user=%user.name
+     dest=%fd.sip:%fd.sport cmd=%proc.cmdline)
+  priority: WARNING
+  tags: [network, exfiltration]
+
+- rule: Bulk data read from pipeline DB config
+  desc: A process read the pipeline DAG config directory — could be credential harvesting.
+  # Linux truncates proc.name (comm) to 15 chars, so the scheduler's own
+  # routine DAG-config parsing shows up as "airflow schedul" (from "airflow
+  # scheduler"), never matching an exact "airflow" — confirmed concretely:
+  # this fired continuously for completely normal scheduler operation, the
+  # single noisiest false positive found. startswith is robust to whatever
+  # any airflow/celery subcommand happens to truncate to.
+  condition: >
+    open_read and
+    airflow_containers and
+    fd.name startswith "/opt/airflow/dags/config" and
+    not (proc.name startswith "airflow" or
+         proc.name startswith "celery" or
+         proc.name in (python3, python))
+  output: >
+    Unexpected read of ETL config
+    (container=%container.name proc=%proc.name user=%user.name file=%fd.name)
+  priority: WARNING
+  tags: [file, credentials]
+
+- rule: Shell spawned inside data container
+  desc: >
+    An interactive shell was launched inside a data container.
+    Could indicate an attacker gaining a foothold.
+  condition: >
+    spawned_process and
+    data_containers and
+    proc.name in (bash, sh, zsh, dash, ksh) and
+    not proc.pname in (bash, sh, airflow, celery, python3, python, entrypoint)
+  output: >
+    Shell spawned in data container
+    (container=%container.name shell=%proc.name parent=%proc.pname
+     user=%user.name cmdline=%proc.cmdline)
+  priority: ERROR
+  tags: [shell, intrusion]
+
+- rule: Sensitive file written in container
+  desc: Write to a sensitive path (postgres HBA, SSH keys, cron) inside a container.
+  condition: >
+    open_write and
+    data_containers and
+    fd.name in (/etc/passwd, /etc/shadow, /etc/crontab,
+                /etc/ssh/sshd_config, /root/.ssh/authorized_keys,
+                /home/.ssh/authorized_keys)
+  output: >
+    Sensitive file written in container
+    (container=%container.name proc=%proc.name file=%fd.name user=%user.name)
+  priority: CRITICAL
+  tags: [file, privilege-escalation]
+
+# ── Postgres rules ────────────────────────────────────────────────────────────
+
+- rule: New user created in Postgres
+  desc: >
+    A CREATE USER / CREATE ROLE statement was executed.
+    Backdoor users are typically added this way.
+  condition: >
+    evt.type = execve and
+    container.name startswith "airflow-postgres" and
+    (proc.cmdline contains "CREATE USER" or proc.cmdline contains "CREATE ROLE")
+  output: >
+    Postgres user creation detected
+    (container=%container.name proc=%proc.name cmdline=%proc.cmdline user=%user.name)
+  priority: WARNING
+  tags: [database, backdoor]
+
+# ── Container escape attempts ─────────────────────────────────────────────────
+
+- rule: Container mount namespace escape attempt
+  desc: Process tried to open /proc/*/ns/* — common technique for container escape.
+  condition: >
+    open_read and
+    data_containers and
+    fd.name glob "/proc/*/ns/*" and
+    not proc.name in (runc, containerd, dockerd)
+  output: >
+    Possible container escape via namespace
+    (container=%container.name proc=%proc.name file=%fd.name user=%user.name)
+  priority: CRITICAL
+  tags: [container-escape]
+
+# "Privilege escalation via setuid binary" rule removed — it used
+# proc.is_suid, which doesn't exist as a Falco field in this version
+# (falco --list has no is_suid/euid field to detect setuid execution),
+# so the rule failed to load and crash-looped the container. Needs a
+# real replacement condition for this Falco version if this coverage
+# is wanted back.

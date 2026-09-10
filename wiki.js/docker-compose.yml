@@ -1,0 +1,32 @@
+# docker-compose.yml for Wiki.js (using the official image)
+
+services:
+  wikidb:
+    image: postgres:13-alpine
+    container_name: wikijs_db
+    environment:
+      POSTGRES_DB: wiki
+      POSTGRES_USER: wikijs
+      POSTGRES_PASSWORD: AdndrjndHH355Admin.123 # <-- IMPORTANT: Set your DB password
+    volumes:
+      - ./wikijs_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  wiki:
+    image: requarks/wiki:2 # This is the official and correct image
+    container_name: wikijs_app
+    environment:
+      DB_TYPE: postgres
+      DB_HOST: wikidb
+      DB_PORT: 5432
+      DB_USER: wikijs
+      DB_PASS: AdndrjndHH355Admin.123 # <-- IMPORTANT: Use the SAME password
+      DB_NAME: wiki
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - wikidb
+
+volumes:
+  wikijs_db_data:

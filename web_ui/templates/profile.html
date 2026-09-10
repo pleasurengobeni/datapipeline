@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Profile</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>My Profile</h1>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in messages %}
+        <div class="alert {% if cat == 'error' %}alert-error{% endif %}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="card" style="max-width:520px;">
+      <div class="card-title">Account Details</div>
+      <div style="font-size:13px;color:#6b7a90;margin-bottom:16px;">
+        <strong>Username:</strong> {{ user[1] }}<br>
+        <strong>Admin:</strong> {{ 'Yes' if user[3] else 'No' }}
+      </div>
+
+      <form method="post" action="{{ url_for('profile') }}">
+        <div class="form-field" style="margin-bottom:12px;">
+          <label>New Password</label>
+          <input type="password" name="password" placeholder="Leave blank to keep current" />
+        </div>
+        <div class="form-field" style="margin-bottom:16px;">
+          <label>Confirm Password</label>
+          <input type="password" name="confirm" placeholder="Repeat new password" />
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-primary" type="submit">Save Changes</button>
+          <a class="btn btn-secondary" href="{{ url_for('index') }}">Cancel</a>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,9 @@
+version: "3.8"
+
+services:
+  adminer:
+    image: adminer
+    container_name: adminer_ide
+    restart: always
+    ports:
+      - "8182:8080"  # Changed host port to 8182

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Data Catalog — ETL Manager</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+  <style>
+    .catalog-stats { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:20px; }
+    .stat-card { background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:16px 22px; min-width:130px; text-align:center; }
+    .stat-card .num { font-size:28px; font-weight:700; color:#1e70bf; }
+    .stat-card .lbl { font-size:11px; color:#6b7a90; margin-top:3px; }
+
+    .catalog-search { width:100%; max-width:480px; padding:9px 14px; border:1px solid #d1d5db;
+                      border-radius:8px; font-size:13px; margin-bottom:20px; box-sizing:border-box; }
+
+    .table-card { background:#fff; border:1px solid #e5e7eb; border-radius:10px; margin-bottom:16px; overflow:hidden; }
+    .table-card-header { display:flex; align-items:center; justify-content:space-between;
+                         padding:12px 18px; background:#f8faff; border-bottom:1px solid #e5e7eb;
+                         cursor:pointer; gap:10px; }
+    .table-card-header:hover { background:#f0f4ff; }
+    .table-card-title { font-weight:700; font-size:14px; color:#1e3a5f; }
+    .table-card-meta  { font-size:11px; color:#6b7a90; display:flex; gap:12px; flex-wrap:wrap; }
+    .table-card-body  { padding:0 0 4px; display:none; }
+    .table-card.open .table-card-body { display:block; }
+
+    .dd-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .dd-table th { background:#f3f4f6; padding:8px 14px; text-align:left; font-weight:600; color:#374151;
+                   border-bottom:2px solid #e5e7eb; }
+    .dd-table td { padding:8px 14px; border-bottom:1px solid #f0f2f5; vertical-align:top; }
+    .dd-table tr:last-child td { border-bottom:none; }
+    .dd-table tr:hover td { background:#fafbff; }
+    .dtype-badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:10px;
+                   font-weight:600; background:#eff6ff; color:#1e40af; border:1px solid #bfdbfe; }
+    .no-desc { color:#9ca3af; font-style:italic; }
+
+    .no-dd-badge { display:inline-flex; align-items:center; gap:4px; padding:2px 10px;
+                   border-radius:10px; font-size:10px; font-weight:600;
+                   background:#fef9c3; color:#92400e; border:1px solid #fde68a; }
+
+    /* Join suggestions */
+    .join-section { margin-top:28px; }
+    .join-card { background:#fff; border:1px solid #e5e7eb; border-radius:10px; padding:16px 18px; margin-bottom:10px; }
+    .join-col-name { font-weight:700; color:#1e3a5f; font-size:13px; margin-bottom:8px; }
+    .join-table-list { display:flex; flex-wrap:wrap; gap:8px; }
+    .join-table-chip { display:inline-flex; align-items:center; gap:5px; padding:4px 10px;
+                       border-radius:20px; font-size:11px; font-weight:600;
+                       background:#f0fdf4; color:#166534; border:1px solid #86efac; }
+    .join-sql { background:#f8faff; border:1px solid #bfdbfe; border-radius:6px;
+                padding:10px 14px; font-family:monospace; font-size:11px; color:#1e40af;
+                margin-top:10px; white-space:pre-wrap; }
+    .copy-btn { background:none; border:1px solid #d1d5db; cursor:pointer; border-radius:5px;
+                padding:2px 8px; font-size:10px; color:#6b7a90; margin-left:8px; }
+    .copy-btn:hover { background:#f3f4f6; }
+
+    .no-dd-empty { text-align:center; padding:40px; color:#9ca3af; font-size:13px; }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <a href="{{ url_for('catalog') }}" style="font-weight:600;color:#3b82f6;">&#128218; Catalog</a>
+      <a href="{{ url_for('jobs') }}">DB Jobs</a>
+      <a href="{{ url_for('file_jobs') }}">File Jobs</a>
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('profile') }}">Profile</a>
+      <a href="{{ url_for('logout') }}">Logout</a>
+    </div>
+  </nav>
+
+  <div class="page-content">
+    <div class="page-header">
+      <h1>&#128218; Data Catalog</h1>
+    </div>
+
+    {# ── Summary stats ── #}
+    <div class="catalog-stats">
+      <div class="stat-card">
+        <div class="num">{{ tables | length }}</div>
+        <div class="lbl">Pipelines</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">{{ tables | selectattr('has_dd') | list | length }}</div>
+        <div class="lbl">With Dictionary</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">{{ total_columns }}</div>
+        <div class="lbl">Documented Columns</div>
+      </div>
+      <div class="stat-card">
+        <div class="num">{{ join_suggestions | length }}</div>
+        <div class="lbl">Potential Joins</div>
+      </div>
+    </div>
+
+    {# ── Search ── #}
+    <input type="text" id="catalogSearch" class="catalog-search"
+           placeholder="&#128269;  Search tables, columns, or descriptions…" />
+
+    {# ── Table cards ── #}
+    <div id="catalogCards">
+      {% for t in tables %}
+      <div class="table-card" data-search="{{ [t.dag_id, t.schema, t.table, t.connection] | join(' ') | lower }}
+           {%- for col, info in (t.data_dictionary or {}).items() %}
+             {{ col }} {{ info.description if info is mapping else info }}
+           {%- endfor %}">
+
+        <div class="table-card-header" onclick="this.parentElement.classList.toggle('open')">
+          <div>
+            <div class="table-card-title">
+              {{ t.schema }}.{{ t.table }}
+              {% if not t.has_dd %}
+              <span class="no-dd-badge">&#9888; No dictionary</span>
+              {% endif %}
+            </div>
+            <div class="table-card-meta">
+              <span>&#128257; {{ t.dag_id }}</span>
+              {% if t.connection %}<span>&#128246; {{ t.connection }}</span>{% endif %}
+              {% if t.pipeline_type == 'file_based' %}
+                <span style="color:#166534;">&#128196; file-based</span>
+              {% else %}
+                <span style="color:#1e40af;">&#128257; db-to-db</span>
+              {% endif %}
+              {% if t.column_count > 0 %}
+                <span>{{ t.column_count }} column{{ 's' if t.column_count != 1 }}</span>
+              {% endif %}
+            </div>
+          </div>
+          <div style="font-size:18px;color:#9ca3af;">&#8964;</div>
+        </div>
+
+        <div class="table-card-body">
+          {% if t.data_dictionary %}
+          <table class="dd-table">
+            <thead>
+              <tr>
+                <th style="width:25%;">Column</th>
+                <th style="width:12%;">Type</th>
+                <th>Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for col, info in t.data_dictionary.items() %}
+              {% set desc  = info.description if info is mapping else info %}
+              {% set dtype = info.dtype if (info is mapping and info.dtype is defined) else '' %}
+              <tr>
+                <td><code>{{ col }}</code></td>
+                <td>{% if dtype %}<span class="dtype-badge">{{ dtype }}</span>{% else %}&mdash;{% endif %}</td>
+                <td>{% if desc %}<span>{{ desc }}</span>{% else %}<span class="no-desc">No description yet</span>{% endif %}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+          {% else %}
+          <div class="no-dd-empty">
+            No data dictionary defined for this pipeline.<br>
+            <a href="{{ url_for('edit_file_job' if t.pipeline_type == 'file_based' else 'edit_job', dag_id=t.dag_id) }}"
+               style="color:#3b82f6;">Edit job</a> to add column descriptions.
+          </div>
+          {% endif %}
+        </div>
+      </div>
+      {% endfor %}
+
+      {% if not tables %}
+      <div class="no-dd-empty">
+        No pipelines configured yet.<br>
+        <a href="{{ url_for('new_job') }}" style="color:#3b82f6;">Create your first job</a>.
+      </div>
+      {% endif %}
+    </div>
+
+    {# ── Join suggestions ── #}
+    {% if join_suggestions %}
+    <div class="join-section">
+      <h2 style="font-size:16px;margin-bottom:12px;color:#1e3a5f;">&#128279; Potential Joins</h2>
+      <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+        Columns with the same name appearing in multiple tables — likely join candidates.
+        Review the descriptions above to confirm the semantics match.
+      </p>
+
+      {% for js in join_suggestions %}
+      <div class="join-card">
+        <div class="join-col-name">
+          <code>{{ js.column }}</code> &mdash; appears in {{ js.tables | length }} tables
+        </div>
+        <div class="join-table-list">
+          {% for ref in js.tables %}
+          <span class="join-table-chip">{{ ref.schema }}.{{ ref.table }}</span>
+          {% endfor %}
+        </div>
+        {# Auto-generated sample SQL for the first two tables #}
+        {% if js.tables | length >= 2 %}
+        {% set t1 = js.tables[0] %}
+        {% set t2 = js.tables[1] %}
+        <div style="margin-top:10px;">
+          <span style="font-size:11px;color:#6b7a90;font-weight:600;">Sample JOIN:</span>
+          <button class="copy-btn" onclick="copyJoinSql(this)">Copy</button>
+          <div class="join-sql" data-sql="SELECT a.*, b.*
+FROM {{ t1.schema }}.{{ t1.table }} a
+JOIN {{ t2.schema }}.{{ t2.table }} b ON a.{{ js.column }} = b.{{ js.column }};">SELECT a.*, b.*
+FROM {{ t1.schema }}.{{ t1.table }} a
+JOIN {{ t2.schema }}.{{ t2.table }} b ON a.{{ js.column }} = b.{{ js.column }};</div>
+        </div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+  </div>{# end page-content #}
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+
+<script>
+  // ── Live search ────────────────────────────────────────────────────────
+  const searchInp = document.getElementById('catalogSearch');
+  searchInp.addEventListener('input', () => {
+    const q = searchInp.value.toLowerCase().trim();
+    document.querySelectorAll('#catalogCards .table-card').forEach(card => {
+      card.style.display = (!q || card.dataset.search.includes(q)) ? '' : 'none';
+    });
+  });
+
+  // ── Copy JOIN SQL ──────────────────────────────────────────────────────
+  function copyJoinSql(btn) {
+    const sqlEl = btn.nextElementSibling;
+    const sql   = sqlEl.dataset.sql || sqlEl.textContent;
+    navigator.clipboard.writeText(sql).then(() => {
+      btn.textContent = '✓ Copied';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1500);
+    });
+  }
+</script>
+</body>
+</html>

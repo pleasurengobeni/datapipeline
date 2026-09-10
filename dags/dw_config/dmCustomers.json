@@ -1,0 +1,41 @@
+{
+  "dag_name": "dw_dimcustomers",
+  "description": "DW pipeline for dimCustomers",
+  "schedule_interval": "@daily",
+  "start_date": "2025-01-01T00:00:00",
+  "default_args": {
+    "owner": "dw_team",
+    "retries": 1,
+    "retry_delay_minutes": 5
+  },
+  "environment_map": {
+    "dev": {
+      "source_conn_id": "postgres_source_dev",
+      "destination_conn_id": "postgres_dw_dev"
+    },
+    "prod": {
+      "source_conn_id": "postgres_source_prod",
+      "destination_conn_id": "postgres_dw_prod"
+    }
+  },
+  "destination": {
+    "schema": "dw_core",
+    "tables": [
+      {
+        "name": "dimCustomers",
+        "ddl_path": "dw_core.dimCustomers_tbl.sql",
+        "proc_path": "dw_core.dimCustomers.sql",
+        "load_proc": "dw_core.dimCustomers",
+        "run_as_proc": true,
+        "depends_on": []
+      }
+    ],
+    "views": [
+      "vw_dimCustomers.sql"
+    ]
+  },
+  "metadata": {
+    "team": "analytics",
+    "business_owner": "ops@example.com"
+  }
+}

@@ -1,0 +1,929 @@
+import glob
+import hashlib
+import logging
+import os
+import re
+import shutil
+import sys
+import unicodedata
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import BranchPythonOperator, PythonOperator
+from airflow.sensors.python import PythonSensor
+from airflow.utils.trigger_rule import TriggerRule
+
+modules_path = Variable.get(
+    "modules_path", default_var=os.path.join(os.getcwd(), "dags", "modules")
+)
+if modules_path not in sys.path:
+    sys.path.insert(1, modules_path)
+
+from modules.utils import get_hook, read_json_file
+from modules import naming
+
+dag_name = "<dag_name>"
+
+# Every pipeline meta column any pipeline_type might write. A table can be
+# written to by any of them over its lifetime, so this list is used both to
+# strip stray meta columns from source data before hashing and to self-heal
+# the target table's schema before insert.
+_ALL_META_COLS = [
+    "_pipeline_inserted_at",
+    "_pipeline_run_id",
+    "_source_file",
+    "_file_checksum",
+    "_source_system",
+    "_loaded_at",
+    "_row_checksum",
+]
+
+
+def clean_string(input_string):
+    return re.sub(r"[^a-zA-Z0-9_]", "_", input_string).lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config loader
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_config(dag_name):
+    config_path = Variable.get(
+        "config_path", default_var=os.path.join(os.getcwd(), "dags", "config")
+    )
+    
+    config_file = naming.find_config_path(dag_name, Path(config_path))
+    if not config_file or not config_file.exists():
+        raise FileNotFoundError(
+            f"Config file for '{dag_name}' not found under '{config_path}'"
+        )
+    config = read_json_file(str(config_file))
+    env = Variable.get("environment", "dev")
+
+    if "source" in config and env in config.get("source", {}):
+        source_cfg = config["source"][env]
+        target_cfg = config["target"][env]
+    else:
+        source_cfg = config["source"]
+        target_cfg = config["target"]
+
+    spark_cfg = config.get("spark", {})
+
+    watch_path   = source_cfg.get("watch_path", "")
+    archive_path = source_cfg.get("archive_path") or os.path.join(watch_path, "archive")
+
+    return {
+        "dag_id":            config.get("dag_id", f"SPARK_FILE_{dag_name}"),
+        "schedule_interval": config.get("schedule_interval"),
+        "start_date":        config.get("start_date", "2023-01-01"),
+        "source": {
+            # Stable shared drop folder — never changes
+            "watch_path":             watch_path,
+            # Exact filename to look for in the drop folder
+            "file_name":              source_cfg.get("file_name") or source_cfg.get("file_pattern", ""),
+            # csv | parquet
+            "file_format":            source_cfg.get("file_format", "csv"),
+            # CSV-specific
+            "delimiter":              source_cfg.get("delimiter", ","),
+            "encoding":               source_cfg.get("encoding", "auto"),
+            "has_header":             source_cfg.get("has_header", True),
+            "null_values":            source_cfg.get("null_values", ["", "NULL", "null", "None", "NA", "N/A", "n/a", "#N/A"]),
+            "date_columns":           source_cfg.get("date_columns", []),
+            "dtype_overrides":        source_cfg.get("dtype_overrides", {}),
+            "skip_rows":              source_cfg.get("skip_rows", 0),
+            # Archive config
+            "archive_path":           archive_path,
+            "archive_retention_days": int(source_cfg.get("archive_retention_days", 30)),
+        },
+        "target": {
+            "target_db_conn_id": target_cfg.get("target_db_conn_id"),
+            "db_type":           target_cfg.get("db_type", "postgresql"),
+            "target_schema":     target_cfg.get("target_schema") or target_cfg.get("target_table_schema"),
+            "target_table":      target_cfg.get("target_table")  or target_cfg.get("target_table_name"),
+        },
+        "spark": {
+            "master":          spark_cfg.get("master", "local[*]"),
+            "app_name":        spark_cfg.get("app_name", dag_name),
+            "executor_memory": spark_cfg.get("executor_memory", "2g"),
+            "executor_cores":  spark_cfg.get("executor_cores", 2),
+            "num_executors":   spark_cfg.get("num_executors", 2),
+            "driver_memory":   spark_cfg.get("driver_memory", "1g"),
+            "extra_conf":      spark_cfg.get("extra_conf", {}),
+        },
+        "transformations":   config.get("transformations", []),
+        "rename_columns":    config.get("rename_columns", []),
+        "write_mode":        config.get("write_mode", "append"),
+        "tags":              config.get("tags", ["ETL", "FILE", "SPARK", "spark-file-etl"]),
+        "source_type":       "file",
+    }
+
+
+CONFIG = load_config(dag_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Column-name normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _clean_col(name: str) -> str:
+    """Normalise: strip accents → lower → replace non-alphanumeric with _ → protect reserved words."""
+    name = unicodedata.normalize("NFD", str(name))
+    name = "".join(c for c in name if unicodedata.category(c) != "Mn")
+    name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    reserved = {"from", "select", "where", "group", "order", "having",
+                "user", "table", "index", "start", "end", "begin", "if"}
+    if name in reserved:
+        name = name + "_"
+    return name or "col"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File-scan and checksum helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_file(watch_path: str, file_name: str):  # -> Optional[str]
+    """Return the full path if file_name exists in watch_path, otherwise None."""
+    if not os.path.isdir(watch_path):
+        return None
+    fpath = os.path.join(watch_path, file_name)
+    return fpath if os.path.isfile(fpath) else None
+
+
+def _compute_md5(file_path: str) -> str:
+    """Return MD5 hex digest of file bytes."""
+    h = hashlib.md5()
+    with open(file_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Encoding detection (used for CSV pre-flight, then passed to Spark)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_encoding(path: str) -> str:
+    try:
+        import chardet
+        with open(path, "rb") as fh:
+            sample = fh.read(65536)
+        result = chardet.detect(sample)
+        enc = (result.get("encoding") or "utf-8").upper().replace("-", "")
+        aliases = {"ASCII": "UTF-8", "UTF8": "UTF-8", "UTF8BOM": "UTF-8",
+                   "UTF16": "UTF-16", "LATIN1": "ISO-8859-1", "ISO88591": "ISO-8859-1"}
+        return aliases.get(enc, result.get("encoding", "UTF-8"))
+    except Exception:
+        return "UTF-8"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spark session factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_spark():
+    from pyspark.sql import SparkSession
+
+    jar_dir  = "/opt/airflow/jars"
+    jar_glob = glob.glob(f"{jar_dir}/*.jar")
+    jars_str = ",".join(jar_glob)
+
+    scfg    = CONFIG["spark"]
+    builder = (
+        SparkSession.builder
+        .appName(scfg["app_name"])
+        .master(scfg["master"])
+        .config("spark.executor.memory", scfg["executor_memory"])
+        .config("spark.executor.cores",  str(scfg["executor_cores"]))
+        .config("spark.driver.memory",   scfg["driver_memory"])
+    )
+    if jars_str:
+        builder = builder.config("spark.jars", jars_str)
+    if scfg.get("num_executors"):
+        builder = builder.config("spark.executor.instances", str(scfg["num_executors"]))
+    for k, v in (scfg.get("extra_conf") or {}).items():
+        builder = builder.config(k, v)
+
+    return builder.getOrCreate()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JDBC helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _jdbc_url_and_props(conn_id: str):
+    hook = get_hook(conn_id)
+    uri  = hook.get_uri()
+    uri  = re.sub(r"^\w+\+\w+://", lambda m: m.group(0).split("+")[0] + "://", uri)
+    from urllib.parse import urlparse
+    p        = urlparse(uri)
+    db_type  = p.scheme.split("+")[0].lower()
+    host, port, db = p.hostname, p.port, p.path.lstrip("/")
+    user, pwd = p.username, p.password
+
+    if db_type in ("postgresql", "postgres"):
+        jdbc_url = f"jdbc:postgresql://{host}:{port or 5432}/{db}"
+        driver   = "org.postgresql.Driver"
+    elif db_type == "mysql":
+        jdbc_url = f"jdbc:mysql://{host}:{port or 3306}/{db}"
+        driver   = "com.mysql.cj.jdbc.Driver"
+    elif db_type in ("mssql", "sqlserver"):
+        jdbc_url = f"jdbc:sqlserver://{host}:{port or 1433};databaseName={db}"
+        driver   = "com.microsoft.sqlserver.jdbc.SQLServerDriver"
+    else:
+        raise ValueError(f"Unsupported db_type for Spark JDBC: {db_type}")
+
+    return jdbc_url, {"user": user, "password": pwd, "driver": driver}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Registry + schema helpers (driver-side, plain SQLAlchemy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_driver_engine():
+    from sqlalchemy import create_engine
+    hook = get_hook(CONFIG["target"]["target_db_conn_id"])
+    return create_engine(hook.get_uri(), pool_pre_ping=True)
+
+
+def _checksum_already_registered(schema: str, table: str, checksum: str) -> bool:
+    """Return True if this MD5 checksum is already in pipeline.file_load_registry."""
+    from sqlalchemy import text
+    engine = _get_driver_engine()
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(
+                text("""
+                    SELECT 1 FROM pipeline.file_load_registry
+                    WHERE target_schema = :s AND target_table = :t AND file_checksum = :c
+                    LIMIT 1
+                """),
+                {"s": schema, "t": table, "c": checksum},
+            )
+            return r.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _ensure_registry_table(conn):
+    from sqlalchemy import text
+    conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS pipeline.file_load_registry (
+            id              SERIAL PRIMARY KEY,
+            dag_id          TEXT,
+            target_schema   TEXT,
+            target_table    TEXT,
+            file_name       TEXT,
+            file_path       TEXT,
+            file_checksum   TEXT,
+            file_size_bytes BIGINT,
+            rows_loaded     BIGINT,
+            run_id          TEXT,
+            loaded_at       TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            archived_to     TEXT,
+            archived_at     TIMESTAMP WITH TIME ZONE
+        )
+    """))
+    conn.execute(text("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_file_registry_checksum
+            ON pipeline.file_load_registry (target_schema, target_table, file_checksum)
+    """))
+
+
+def _ensure_schema(schema: str):
+    from sqlalchemy import text
+    engine = _get_driver_engine()
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+
+
+def _ensure_pipeline_metadata_columns(schema: str, table: str):
+    """ALTER TABLE to add pipeline metadata columns if they don't exist yet.
+    Safe to call every run — IF NOT EXISTS is idempotent. A table can be
+    written to by any pipeline_type over its lifetime (db, file, hybrid,
+    spark, spark_file), so every meta column any of them might need must
+    exist regardless of which one created or last wrote the table."""
+    from sqlalchemy import text
+    engine = _get_driver_engine()
+    cols = [
+        ("_pipeline_inserted_at", "TIMESTAMP"),
+        ("_pipeline_run_id",      "TEXT"),
+        ("_source_file",          "TEXT"),
+        ("_file_checksum",        "TEXT"),
+        ("_source_system",        "TEXT"),
+        ("_loaded_at",            "TIMESTAMP"),
+        ("_row_checksum",         "TEXT"),
+    ]
+    with engine.begin() as conn:
+        for col_name, col_type in cols:
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{table}" '
+                f'ADD COLUMN IF NOT EXISTS "{col_name}" {col_type}'
+            ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tasks
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sense_file_fn(**ctx) -> bool:
+    """
+    PythonSensor poke: check watch_path for the exact file_name.
+    Pushes matched file path to XCom. Returns True when the file is found.
+    """
+    src        = CONFIG["source"]
+    watch_path = src["watch_path"]
+    file_name  = src["file_name"]
+
+    matched = _find_file(watch_path, file_name)
+    if matched:
+        ctx["ti"].xcom_push(key="matched_file", value=matched)
+        logging.info(f"[spark_file][sense] Found: {matched}")
+        return True
+
+    logging.info(f"[spark_file][sense] '{file_name}' not yet in '{watch_path}' — retrying.")
+    return False
+
+
+def compute_checksum(**ctx):
+    """Compute MD5 of the matched file and push to XCom."""
+    file_path = ctx["ti"].xcom_pull(task_ids="sense_file", key="matched_file")
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"[compute_checksum] File not found: {file_path}")
+
+    checksum  = _compute_md5(file_path)
+    file_size = os.path.getsize(file_path)
+    logging.info(f"[compute_checksum] {file_path} | MD5={checksum} | size={file_size}")
+    ctx["ti"].xcom_push(key="checksum",  value=checksum)
+    ctx["ti"].xcom_push(key="file_size", value=file_size)
+
+
+def check_registry(**ctx):
+    """Branch: skip if checksum already registered, otherwise load."""
+    schema   = CONFIG["target"]["target_schema"]
+    table    = CONFIG["target"]["target_table"]
+    checksum = ctx["ti"].xcom_pull(task_ids="compute_checksum", key="checksum")
+
+    if _checksum_already_registered(schema, table, checksum):
+        logging.info(f"[spark_file][registry] Checksum {checksum} already loaded — skipping.")
+        return "already_loaded"
+    return "load_file"
+
+
+def load_file(**ctx):
+    """
+    Read CSV or Parquet with PySpark, clean columns, add pipeline metadata,
+    write to target via JDBC.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import (
+        BooleanType, DateType, DoubleType,
+        IntegerType, LongType, StringType, TimestampType,
+    )
+
+    ti       = ctx["ti"]
+    src      = CONFIG["source"]
+    tgt      = CONFIG["target"]
+    schema   = tgt["target_schema"]
+    table    = tgt["target_table"]
+
+    file_path   = ti.xcom_pull(task_ids="sense_file",       key="matched_file")
+    checksum    = ti.xcom_pull(task_ids="compute_checksum",  key="checksum")
+    file_name   = Path(file_path).name
+    file_format = src["file_format"].lower()
+    run_id      = ctx.get("run_id", ctx["dag_run"].run_id)
+
+    spark = _get_spark()
+    _ensure_schema(schema)
+
+    # ── Read source file ──────────────────────────────────────────────────
+    if file_format == "parquet":
+        df = spark.read.parquet(file_path)
+    else:
+        encoding_cfg = src.get("encoding", "auto")
+        encoding     = _detect_encoding(file_path) if encoding_cfg == "auto" else encoding_cfg
+        delimiter    = src.get("delimiter", ",")
+        has_header   = src.get("has_header", True)
+
+        logging.info(
+            f"[spark_file] Reading CSV: {file_path} | enc={encoding} | sep={repr(delimiter)}"
+        )
+        df = (
+            spark.read
+            .option("header",      str(has_header).lower())
+            .option("sep",         delimiter)
+            .option("encoding",    encoding)
+            .option("inferSchema", "false")
+            .option("nullValue",   "")
+            .option("emptyValue",  "")
+            .option("mode",        "PERMISSIVE")
+            .option("multiLine",   "false")
+            .csv(file_path)
+        )
+
+    # ── Normalise column names ────────────────────────────────────────────
+    df = df.toDF(*[_clean_col(c) for c in df.columns])
+
+    # ── Strip control characters from string columns ──────────────────────
+    ctrl_pattern = r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
+    string_cols  = [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]
+    for col in string_cols:
+        df = df.withColumn(col, F.regexp_replace(F.trim(F.col(col)), ctrl_pattern, ""))
+
+    # ── Null sentinels → null ─────────────────────────────────────────────
+    null_upper = [str(v).strip().upper() for v in src.get("null_values", []) if str(v).strip()]
+    for col in string_cols:
+        df = df.withColumn(
+            col,
+            F.when(F.upper(F.trim(F.col(col))).isin(null_upper), F.lit(None)).otherwise(F.col(col))
+        )
+
+    # ── dtype_overrides ───────────────────────────────────────────────────
+    type_map = {
+        "int": IntegerType(), "int64": LongType(), "integer": IntegerType(), "bigint": LongType(),
+        "float": DoubleType(), "float64": DoubleType(), "numeric": DoubleType(), "decimal": DoubleType(),
+        "bool": BooleanType(), "boolean": BooleanType(),
+        "date": DateType(), "timestamp": TimestampType(), "datetime": TimestampType(),
+    }
+    for raw_col, dtype_str in src.get("dtype_overrides", {}).items():
+        col        = _clean_col(raw_col)
+        spark_type = type_map.get(dtype_str.lower())
+        if col in df.columns and spark_type:
+            df = df.withColumn(col, F.col(col).cast(spark_type))
+
+    # ── Explicit date columns ─────────────────────────────────────────────
+    already_cast = {_clean_col(c) for c in src.get("dtype_overrides", {})}
+    for raw_col in src.get("date_columns", []):
+        col = _clean_col(raw_col)
+        if col in df.columns and col not in already_cast:
+            df = df.withColumn(col, F.to_timestamp(F.col(col)))
+
+    # ── Auto-infer numerics for remaining string columns ──────────────────
+    all_cast = already_cast | {_clean_col(c) for c in src.get("date_columns", [])}
+    for col in [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]:
+        if col in all_cast:
+            continue
+        attempt_int    = df.withColumn("__probe__", F.col(col).cast(LongType()))
+        non_null_count = df.filter(F.col(col).isNotNull()).count()
+        parsed_count   = attempt_int.filter(F.col("__probe__").isNotNull()).count()
+        if non_null_count > 0 and parsed_count / non_null_count >= 0.8:
+            df = df.withColumn(col, F.col(col).cast(LongType()))
+        else:
+            attempt_dbl = df.withColumn("__probe__", F.col(col).cast(DoubleType()))
+            parsed_dbl  = attempt_dbl.filter(F.col("__probe__").isNotNull()).count()
+            if non_null_count > 0 and parsed_dbl / non_null_count >= 0.8:
+                df = df.withColumn(col, F.col(col).cast(DoubleType()))
+        if "__probe__" in df.columns:
+            df = df.drop("__probe__")
+
+    # ── Column renames from config ────────────────────────────────────────
+    for entry in CONFIG.get("rename_columns", []):
+        for old, new in entry.items():
+            old_c, new_c = _clean_col(old), _clean_col(new)
+            if old_c in df.columns:
+                df = df.withColumnRenamed(old_c, new_c)
+
+    # ── Pipeline metadata columns ─────────────────────────────────────────
+    now = datetime.utcnow()
+
+    # Row-level checksum: MD5 of all data column values concatenated.
+    # Drop any meta columns the source file may already carry (e.g. a file
+    # exported from another DW table) so the hash reflects data only, not
+    # volatile pipeline metadata.
+    df = df.drop(*[c for c in _ALL_META_COLS if c in df.columns])
+    data_cols = [c for c in df.columns]
+    row_concat = F.concat_ws("|", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in data_cols])
+    df  = df.withColumn("_row_checksum", F.md5(row_concat))
+
+    df  = df.withColumn("_pipeline_inserted_at", F.lit(str(now)).cast(TimestampType()))
+    df  = df.withColumn("_pipeline_run_id",       F.lit(run_id))
+    df  = df.withColumn("_source_file",           F.lit(file_name))
+    df  = df.withColumn("_file_checksum",         F.lit(checksum))
+    df  = df.withColumn("_loaded_at",             F.lit(str(now)).cast(TimestampType()))
+
+    # ── Self-heal: ensure meta columns exist regardless of which pipeline_type
+    # last created/wrote this table (see _ensure_pipeline_metadata_columns) ──
+    _ensure_pipeline_metadata_columns(schema, table)
+
+    # ── JDBC write ────────────────────────────────────────────────────────
+    tgt_jdbc_url, tgt_props = _jdbc_url_and_props(tgt["target_db_conn_id"])
+
+    rows_loaded = df.count()
+    (
+        df.write
+        .format("jdbc")
+        .option("url",      tgt_jdbc_url)
+        .option("dbtable",  f'"{schema}"."{table}"')
+        .option("user",     tgt_props["user"])
+        .option("password", tgt_props["password"])
+        .option("driver",   tgt_props["driver"])
+        .option("batchsize", "10000")
+        .mode("append")
+        .save()
+    )
+
+    logging.info(f"[spark_file] Loaded {rows_loaded} rows → {schema}.{table}")
+    ti.xcom_push(key="rows_loaded", value=rows_loaded)
+    ti.xcom_push(key="file_name",   value=file_name)
+
+
+def archive_file(**ctx):
+    """Copy the loaded file to the archive folder (timestamped), then delete the original.
+
+    Uses copy2 + os.remove instead of shutil.move so it works safely across
+    different Docker volume mounts / filesystems where rename(2) would fail.
+    """
+    ti        = ctx["ti"]
+    src       = CONFIG["source"]
+    file_path = ti.xcom_pull(task_ids="sense_file", key="matched_file")
+
+    logging.info("[archive_file] source file XCom value: %r", file_path)
+
+    if not file_path:
+        logging.warning("[archive_file] No file path in XCom — nothing to archive.")
+        ti.xcom_push(key="archived_to", value=None)
+        return
+
+    if not os.path.exists(file_path):
+        logging.warning("[archive_file] Source file does not exist on disk: %s", file_path)
+        ti.xcom_push(key="archived_to", value=None)
+        return
+
+    archive_dir = src["archive_path"]
+    logging.info("[archive_file] archive_dir resolved to: %r", archive_dir)
+
+    try:
+        os.makedirs(archive_dir, exist_ok=True)
+        logging.info("[archive_file] archive_dir ensured: %s", archive_dir)
+    except OSError as exc:
+        logging.error("[archive_file] Cannot create archive dir %s: %s", archive_dir, exc)
+        raise
+
+    p         = Path(file_path)
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    new_name  = f"{p.stem}_{timestamp}{p.suffix}"
+    dest      = os.path.join(archive_dir, new_name)
+
+    logging.info("[archive_file] Copying '%s' → '%s'", file_path, dest)
+    try:
+        shutil.copy2(file_path, dest)
+    except Exception as exc:
+        logging.error("[archive_file] copy2 failed: %s", exc)
+        raise
+
+    # Verify the copy landed correctly before deleting the source
+    if not os.path.exists(dest):
+        raise FileNotFoundError(
+            f"[archive_file] Copy appeared to succeed but dest not found: {dest}"
+        )
+    if os.path.getsize(dest) != os.path.getsize(file_path):
+        raise ValueError(
+            f"[archive_file] Size mismatch after copy: "
+            f"src={os.path.getsize(file_path)} dest={os.path.getsize(dest)}"
+        )
+
+    try:
+        os.remove(file_path)
+        logging.info("[archive_file] Deleted original: %s", file_path)
+    except OSError as exc:
+        logging.warning(
+            "[archive_file] Could not delete original file %s (archive copy is safe): %s",
+            file_path, exc
+        )
+        # Don't re-raise — archive copy succeeded, original deletion is best-effort
+
+    logging.info("[archive_file] ✅ Archived '%s' → '%s'", file_path, dest)
+    ti.xcom_push(key="archived_to", value=dest)
+
+
+def cleanup_archive(**ctx):
+    """Delete archive files older than archive_retention_days."""
+    src            = CONFIG["source"]
+    archive_dir    = src["archive_path"]
+    retention_days = src["archive_retention_days"]
+    cutoff         = datetime.utcnow().timestamp() - retention_days * 86400
+
+    if not os.path.isdir(archive_dir):
+        return
+
+    deleted = 0
+    for fname in os.listdir(archive_dir):
+        fpath = os.path.join(archive_dir, fname)
+        if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+            os.remove(fpath)
+            deleted += 1
+            logging.info(f"[cleanup_archive] Deleted: {fpath}")
+
+    logging.info(f"[cleanup_archive] Removed {deleted} files older than {retention_days} days.")
+
+
+def collect_metrics_fn(**ctx):
+    """Write run metrics to pipeline.etl_metrics and file registry (engine_type='spark', source_type='file')."""
+    from sqlalchemy import create_engine, text
+    from airflow.utils import timezone
+
+    ti          = ctx["ti"]
+    dag_run     = ctx["dag_run"]
+    env         = Variable.get("environment", "dev")
+    run_id      = dag_run.run_id
+    run_start   = dag_run.start_date
+    run_end     = timezone.utcnow()
+    duration    = int((run_end - run_start).total_seconds()) if run_start else None
+
+    rows_loaded = ti.xcom_pull(task_ids="load_file",        key="rows_loaded") or 0
+    file_name   = ti.xcom_pull(task_ids="load_file",        key="file_name")   or ""
+    checksum    = ti.xcom_pull(task_ids="compute_checksum", key="checksum")    or ""
+    file_size   = ti.xcom_pull(task_ids="compute_checksum", key="file_size")   or 0
+    file_path   = ti.xcom_pull(task_ids="sense_file",       key="matched_file") or ""
+    archived_to = ti.xcom_pull(task_ids="archive_file",     key="archived_to")
+
+    schema = CONFIG["target"]["target_schema"]
+    table  = CONFIG["target"]["target_table"]
+
+    hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine = create_engine(hook.get_uri())
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id                          SERIAL PRIMARY KEY,
+                dag_id                      TEXT,
+                env                         TEXT,
+                schema                      TEXT,
+                table_name                  TEXT,
+                run_id                      TEXT,
+                run_start                   TIMESTAMP WITH TIME ZONE,
+                run_end                     TIMESTAMP WITH TIME ZONE,
+                run_duration_secs           INTEGER,
+                run_status                  TEXT NOT NULL DEFAULT 'success',
+                error_msg                   TEXT,
+                batch_size                  INTEGER,
+                rows_loaded_now             BIGINT,
+                target_total_records        BIGINT,
+                target_today_records        BIGINT,
+                target_max_upload_date      TIMESTAMP,
+                target_first_upload_date    TIMESTAMP,
+                target_max_incremental      TEXT,
+                source_total_records        BIGINT,
+                source_max_incremental      TEXT,
+                source_loaded_to_max_target BIGINT,
+                perc_loaded                 NUMERIC(6,2),
+                created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type                 TEXT DEFAULT 'pandas',
+                source_type                 TEXT DEFAULT 'db'
+            )
+        """))
+        for m in [
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'db'",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_today_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_first_upload_date TIMESTAMP",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS target_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_total_records BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_max_incremental TEXT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_loaded_to_max_target BIGINT",
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS perc_loaded NUMERIC(6,2)",
+        ]:
+            conn.execute(text(m))
+
+        # Counts plus load-recency from the target's own _loaded_at meta
+        # column, which every row is stamped with at load time. A file job
+        # has no incremental_column to key a "today" figure off, but "when
+        # did this pipeline write the row" is always known — without this
+        # the freshness columns sit NULL and the dashboard reports 0 rows
+        # loaded today for a table that in fact loaded thousands.
+        target_today = target_max_upload = target_first_upload = None
+        try:
+            conn.execute(text("SAVEPOINT count_check"))
+            r = conn.execute(text(f"""
+                SELECT COUNT(*),
+                       COUNT(*) FILTER (WHERE "_loaded_at" >= date_trunc('day', now())),
+                       MAX("_loaded_at"),
+                       MIN("_loaded_at")
+                FROM "{schema}"."{table}"
+            """)).fetchone()
+            target_total, target_today = r[0] or 0, r[1] or 0
+            target_max_upload, target_first_upload = r[2], r[3]
+            conn.execute(text("RELEASE SAVEPOINT count_check"))
+        except Exception:
+            # Target missing, or predating the pipeline meta columns.
+            conn.execute(text("ROLLBACK TO SAVEPOINT count_check"))
+            try:
+                conn.execute(text("SAVEPOINT count_check"))
+                target_total = conn.execute(
+                    text(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
+                ).scalar() or 0
+                conn.execute(text("RELEASE SAVEPOINT count_check"))
+            except Exception:
+                conn.execute(text("ROLLBACK TO SAVEPOINT count_check"))
+                target_total = 0
+
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status,
+                batch_size, rows_loaded_now, target_total_records,
+                target_today_records, target_max_upload_date,
+                target_first_upload_date, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name, :run_id,
+                :run_start, :run_end, :duration, 'success',
+                0, :rows_loaded, :target_total,
+                :target_today, :target_max_upload,
+                :target_first_upload, 'spark', 'file'
+            )
+        """), {
+            "dag_id":              CONFIG["dag_id"],
+            "env":                 env,
+            "schema":              schema,
+            "table_name":          table,
+            "run_id":              run_id,
+            "run_start":           run_start,
+            "run_end":             run_end,
+            "duration":            duration,
+            "rows_loaded":         rows_loaded,
+            "target_total":        target_total,
+            "target_today":        target_today,
+            "target_max_upload":   target_max_upload,
+            "target_first_upload": target_first_upload,
+        })
+
+        # ── Ensure file_load_registry and insert ──────────────────────────
+        _ensure_registry_table(conn)
+        conn.execute(text("""
+            INSERT INTO pipeline.file_load_registry (
+                dag_id, target_schema, target_table, file_name, file_path,
+                file_checksum, file_size_bytes, rows_loaded, run_id,
+                loaded_at, archived_to, archived_at
+            ) VALUES (
+                :dag_id, :schema, :table, :file_name, :file_path,
+                :checksum, :file_size, :rows_loaded, :run_id,
+                NOW(), :archived_to, CASE WHEN :archived_to2 IS NOT NULL THEN NOW() ELSE NULL END
+            )
+            ON CONFLICT (target_schema, target_table, file_checksum) DO NOTHING
+        """), {
+            "dag_id":      CONFIG["dag_id"],
+            "schema":      schema,
+            "table":       table,
+            "file_name":   file_name,
+            "file_path":   file_path,
+            "checksum":    checksum,
+            "file_size":   file_size,
+            "rows_loaded": rows_loaded,
+            "run_id":      run_id,
+            "archived_to": archived_to,
+            "archived_to2": archived_to,
+        })
+
+    logging.info(
+        f"[spark_file][metrics] dag={CONFIG['dag_id']} | {schema}.{table} | "
+        f"rows={rows_loaded} | file='{file_name}' | checksum={checksum}"
+    )
+
+
+def collect_error_metrics_fn(**ctx):
+    """Write failure metrics (engine_type='spark', source_type='file')."""
+    from sqlalchemy import create_engine, text
+
+    run_start = ctx["dag_run"].start_date
+    run_end   = datetime.utcnow()
+    duration  = int((run_end - run_start).total_seconds()) if run_start else None
+    error_msg = str(ctx.get("exception", "Unknown error"))[:2000]
+
+    env    = Variable.get("environment", "dev")
+    schema = CONFIG["target"]["target_schema"]
+    table  = CONFIG["target"]["target_table"]
+
+    hook   = get_hook(CONFIG["target"]["target_db_conn_id"])
+    engine = create_engine(hook.get_uri())
+
+    with engine.begin() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS pipeline"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pipeline.etl_metrics (
+                id SERIAL PRIMARY KEY, dag_id TEXT, env TEXT, schema TEXT,
+                table_name TEXT, run_id TEXT, run_start TIMESTAMP WITH TIME ZONE,
+                run_end TIMESTAMP WITH TIME ZONE, run_duration_secs INTEGER,
+                run_status TEXT NOT NULL DEFAULT 'success', error_msg TEXT,
+                batch_size INTEGER, rows_loaded_now BIGINT,
+                target_total_records BIGINT, target_today_records BIGINT,
+                target_max_upload_date TIMESTAMP, target_first_upload_date TIMESTAMP,
+                target_max_incremental TEXT, source_total_records BIGINT,
+                source_max_incremental TEXT, source_loaded_to_max_target BIGINT,
+                perc_loaded NUMERIC(6,2), created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                engine_type TEXT DEFAULT 'pandas', source_type TEXT DEFAULT 'db'
+            )
+        """))
+        conn.execute(text(
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS engine_type TEXT DEFAULT 'pandas'"
+        ))
+        conn.execute(text(
+            "ALTER TABLE pipeline.etl_metrics ADD COLUMN IF NOT EXISTS source_type TEXT DEFAULT 'db'"
+        ))
+        conn.execute(text("""
+            INSERT INTO pipeline.etl_metrics (
+                dag_id, env, schema, table_name, run_id,
+                run_start, run_end, run_duration_secs, run_status, error_msg,
+                batch_size, rows_loaded_now, engine_type, source_type
+            ) VALUES (
+                :dag_id, :env, :schema, :table_name, :run_id,
+                :run_start, :run_end, :duration, 'failed', :error_msg,
+                0, 0, 'spark', 'file'
+            )
+        """), {
+            "dag_id":     CONFIG["dag_id"],
+            "env":        env,
+            "schema":     schema,
+            "table_name": table,
+            "run_id":     ctx["run_id"],
+            "run_start":  run_start,
+            "run_end":    run_end,
+            "duration":   duration,
+            "error_msg":  error_msg,
+        })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DAG definition
+# ─────────────────────────────────────────────────────────────────────────────
+
+default_args = {
+    "owner":            "airflow",
+    "depends_on_past":  False,
+    "retries":          1,
+    "retry_delay":      timedelta(minutes=5),
+    "on_failure_callback": lambda ctx: collect_error_metrics_fn(**ctx),
+}
+
+with DAG(
+    dag_id=CONFIG["dag_id"],
+    default_args=default_args,
+    schedule_interval=CONFIG["schedule_interval"],
+    start_date=datetime.strptime(CONFIG["start_date"], "%Y-%m-%d"),
+    catchup=False,
+    tags=CONFIG["tags"],
+    description=(
+        f"File-based ETL — Spark — "
+        f"{CONFIG['source']['file_format'].upper()} → "
+        f"{CONFIG['target']['target_schema']}.{CONFIG['target']['target_table']}"
+    ),
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    # ── Event-driven sensor: polls watch_path every 60s for a matching file ──
+    sense = PythonSensor(
+        task_id="sense_file",
+        python_callable=sense_file_fn,
+        poke_interval=60,
+        timeout=86400,
+        mode="reschedule",
+        soft_fail=True,
+    )
+
+    checksum_task = PythonOperator(
+        task_id="compute_checksum",
+        python_callable=compute_checksum,
+    )
+
+    registry_branch = BranchPythonOperator(
+        task_id="check_registry",
+        python_callable=check_registry,
+    )
+
+    already_loaded = EmptyOperator(task_id="already_loaded")
+
+    load = PythonOperator(
+        task_id="load_file",
+        python_callable=load_file,
+    )
+
+    archive = PythonOperator(
+        task_id="archive_file",
+        python_callable=archive_file,
+        trigger_rule=TriggerRule.ONE_SUCCESS,
+    )
+
+    cleanup = PythonOperator(
+        task_id="cleanup_archive",
+        python_callable=cleanup_archive,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    metrics = PythonOperator(
+        task_id="collect_metrics",
+        python_callable=collect_metrics_fn,
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
+
+    start >> sense >> checksum_task >> registry_branch
+    registry_branch >> [load, already_loaded]
+    load >> archive >> cleanup >> metrics >> end
+    already_loaded >> end

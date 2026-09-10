@@ -1,0 +1,9 @@
+streamlit>=1.32.0
+plotly>=5.18.0
+pandas>=2.0.0
+numpy>=1.26.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+cryptography>=41.0.0
+statsmodels>=0.14.0
+scikit-learn>=1.4.0

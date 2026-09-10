@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ 'Edit' if config else 'New' }} ETL Job</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+  <!-- CodeMirror SQL editor -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css" integrity="sha512-uf06llspW44/LZpHzHT6qBOIVODjWtv4MxCricRxkzvopAlSWnTf6hpZTFxuuZcKog21xx0fizo0N6O2yLHCw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <style>
+    .env-banner { display:flex; align-items:center; gap:8px; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; margin-bottom:14px; }
+    .env-banner.dev  { background:#dcfce7; color:#15803d; border:1px solid #86efac; }
+    .env-banner.prod { background:#fef9c3; color:#92400e; border:1px solid #fde68a; }
+    .env-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .env-banner.dev  .env-dot { background:#22c55e; }
+    .env-banner.prod .env-dot { background:#f59e0b; }
+    /* SQL query window (pgAdmin-like) */
+    .sql-window { border: 1px solid #cbd5e1; border-radius: 8px; overflow: hidden; background: #ffffff; }
+    .sql-toolbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 10px;
+      background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+      border-bottom: 1px solid #dbe4ef;
+    }
+    .sql-toolbar-left { display: flex; align-items: center; gap: 8px; }
+    .sql-toolbar-title { font-size: 12px; color: #334155; font-weight: 700; letter-spacing: .2px; }
+    .sql-toolbar-btn {
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      color: #0f172a;
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 6px;
+      padding: 5px 10px;
+      cursor: pointer;
+    }
+    .sql-toolbar-btn:hover { background: #f1f5f9; }
+
+    .CodeMirror {
+      height: auto;
+      min-height: 230px;
+      font-size: 16px;
+      line-height: 1.5;
+      font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+      border: 0;
+      background: #fbfdff;
+    }
+    .CodeMirror-scroll { min-height: 230px; }
+    .CodeMirror-gutters { background: #f5f8fc; border-right: 1px solid #e2e8f0; }
+    .CodeMirror-linenumber { color: #94a3b8; }
+    .CodeMirror-activeline-background { background: #eff6ff; }
+
+    /* SQL token colors */
+    .cm-s-default .cm-keyword { color: #7c3aed; font-weight: 700; }
+    .cm-s-default .cm-operator { color: #1f2937; }
+    .cm-s-default .cm-number { color: #c2410c; }
+    .cm-s-default .cm-string { color: #047857; }
+    .cm-s-default .cm-comment { color: #64748b; font-style: italic; }
+    .cm-s-default .cm-def,
+    .cm-s-default .cm-variable,
+    .cm-s-default .cm-variable-2,
+    .cm-s-default .cm-variable-3 { color: #0f172a; }
+    .cm-s-default .cm-builtin { color: #0369a1; }
+
+    @media (max-width: 768px) {
+      .sql-toolbar { flex-direction: column; align-items: flex-start; gap: 8px; }
+      .CodeMirror,
+      .CodeMirror-scroll { min-height: 190px; }
+    }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETLMGR" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('catalog') }}">&#128218; Catalog</a>
+      <a href="{{ url_for('profile') }}">Profile</a>
+    </div>
+  </nav>
+
+  <main class="main-content" style="padding:24px;max-width:1100px;margin:0 auto;width:100%;">
+
+    {# ── Environment banner ── #}
+    {% if active_env == 'dev' %}
+    <div class="env-banner dev"><span class="env-dot"></span> Editing <strong>DEV</strong> environment only &mdash; prod fields are preserved from the saved config.</div>
+    {% elif active_env == 'prod' %}
+    <div class="env-banner prod"><span class="env-dot"></span> Editing <strong>PROD</strong> environment only &mdash; dev fields are preserved from the saved config.</div>
+    {% endif %}
+
+    <form method="post" id="jobForm">
+
+      {# ── When env-scoped: carry over the OTHER env's fields as hidden inputs so they are not lost on save ── #}
+      {% if config and config.spark and not (active_env == '') %}
+        {# Preserve existing spark config when form is submitted without touching the Spark panel #}
+        <input type="hidden" name="_existing_spark_master"           value="{{ config.spark.master or 'local[*]' }}" />
+        <input type="hidden" name="_existing_spark_app_name"         value="{{ config.spark.app_name or '' }}" />
+        <input type="hidden" name="_existing_spark_driver_memory"    value="{{ config.spark.driver_memory or '1g' }}" />
+        <input type="hidden" name="_existing_spark_executor_memory"  value="{{ config.spark.executor_memory or '2g' }}" />
+        <input type="hidden" name="_existing_spark_executor_cores"   value="{{ config.spark.executor_cores or 2 }}" />
+        <input type="hidden" name="_existing_spark_num_executors"    value="{{ config.spark.num_executors or 2 }}" />
+      {% endif %}
+
+      {% if active_env == 'dev' and config %}
+        <input type="hidden" name="prod_source_db_conn_id"  value="{{ config.source.prod.source_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_source_db_type"     value="{{ config.source.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_hwm_column"         value="{{ config.source.prod.incremental_column or '' }}" />
+        <input type="hidden" name="prod_hwm_datatype"       value="{{ config.source.prod.incremental_column_datatype or 'timestamp' }}" />
+        <input type="hidden" name="prod_hwm_date_format"    value="{{ config.source.prod.incremental_column_date_format or '' }}" />
+        <input type="hidden" name="prod_batch_size"         value="{{ config.source.prod.batch_size or 0 }}" />
+        <input type="hidden" name="prod_target_db_conn_id"  value="{{ config.target.prod.target_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_target_db_type"     value="{{ config.target.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_target_schema"      value="{{ config.target.prod.target_schema or '' }}" />
+        <input type="hidden" name="prod_target_table"       value="{{ config.target.prod.target_table or '' }}" />
+        <input type="hidden" name="prod_target_hwm_column"  value="{{ config.target.prod.hwm_column or '' }}" />
+        <input type="hidden" name="prod_load_strategy"      value="{{ config.target.prod.load_strategy or 'append' }}" />
+        <input type="hidden" name="prod_sql_text"           value="{{ prod_sql_text or '' }}" />
+      {% elif active_env == 'prod' and config %}
+        <input type="hidden" name="dev_source_db_conn_id"   value="{{ config.source.dev.source_db_conn_id or '' }}" />
+        <input type="hidden" name="dev_source_db_type"      value="{{ config.source.dev.db_type or 'postgresql' }}" />
+        <input type="hidden" name="dev_hwm_column"          value="{{ config.source.dev.incremental_column or '' }}" />
+        <input type="hidden" name="dev_hwm_datatype"        value="{{ config.source.dev.incremental_column_datatype or 'timestamp' }}" />
+        <input type="hidden" name="dev_hwm_date_format"     value="{{ config.source.dev.incremental_column_date_format or '' }}" />
+        <input type="hidden" name="dev_batch_size"          value="{{ config.source.dev.batch_size or 0 }}" />
+        <input type="hidden" name="dev_target_db_conn_id"   value="{{ config.target.dev.target_db_conn_id or '' }}" />
+        <input type="hidden" name="dev_target_db_type"      value="{{ config.target.dev.db_type or 'postgresql' }}" />
+        <input type="hidden" name="dev_target_schema"       value="{{ config.target.dev.target_schema or '' }}" />
+        <input type="hidden" name="dev_target_table"        value="{{ config.target.dev.target_table or '' }}" />
+        <input type="hidden" name="dev_target_hwm_column"   value="{{ config.target.dev.hwm_column or '' }}" />
+        <input type="hidden" name="dev_load_strategy"       value="{{ config.target.dev.load_strategy or 'append' }}" />
+        <input type="hidden" name="dev_sql_text"            value="{{ dev_sql_text or '' }}" />
+      {% endif %}
+
+      <!-- Step Tabs -->
+      <div class="step-tabs" id="stepTabs">
+        <div class="step-tab active" data-idx="0">1. Basics</div>
+        <div class="step-tab"        data-idx="1">2. Source</div>
+        <div class="step-tab"        data-idx="2">3. Target</div>
+        <div class="step-tab"        data-idx="3">4. Dictionary</div>
+        <div class="step-tab"        data-idx="4">5. Review</div>
+      </div>
+
+      <!-- ── STEP 1: Basics ── -->
+      <div class="card form-step" data-step="0">
+        <div class="card-title">Job Basics</div>
+        <div class="form-grid">
+
+          <div class="form-field">
+            <label>DAG ID *</label>
+            <input name="dag_id" value="{{ config.dag_id if config else '' }}" required placeholder="e.g. cenfri_entity_sales" />
+          </div>
+
+          <div class="form-field">
+            <label>Schedule — pick preset</label>
+            <select id="schedulePicker">
+              <option value="">— select a preset —</option>
+              {% for lbl, cron in schedule_suggestions %}
+              <option value="{{ cron }}">{{ lbl }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule Interval (cron)</label>
+            <input id="scheduleInterval" name="schedule_interval"
+                   value="{{ (config.schedule_interval or '') if config else '0 2 * * *' }}"
+                   placeholder="0 2 * * *" />
+          </div>
+
+          <div class="form-field span-2">
+            <label>Additional Tags (comma-separated)</label>
+            <input name="extra_tags"
+                   value="{{ extra_tags_str if extra_tags_str is defined else '' }}"
+                   placeholder="e.g. finance, daily, cenfri" />
+            <span class="field-hint">Your username is always included automatically.</span>
+          </div>
+
+          <div class="form-field" style="display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:6px;">
+            <label>Current Tags</label>
+            <div class="tags-row">
+              {% if current_username %}<span class="tag tag-owner">{{ current_username }}</span>{% endif %}
+              {% for t in existing_tags[1:] %}<span class="tag">{{ t }}</span>{% endfor %}
+            </div>
+          </div>
+
+          <input type="hidden" name="created_by" value="{{ current_username }}" />
+
+        </div>
+
+        {# "Same as dev" toggle only shown when both envs are editable #}
+        {% if active_env %}
+        {# Single-env mode: prod config always mirrors dev — send "on" so backend doesn't look for absent prod fields #}
+        <input type="hidden" name="apply_prod_same_as_dev" value="on" />
+        {% else %}
+        <div class="toggle-field">
+          <label class="toggle-switch">
+            <input type="checkbox" name="apply_prod_same_as_dev" id="sameAsDev" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="sameAsDev">Use same settings for Prod as Dev</label>
+        </div>
+        {% endif %}
+
+        {# ── Spark engine toggle ── #}
+        <div class="toggle-field" style="margin-top:14px;padding-top:14px;border-top:1px solid #e5e7eb;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="use_spark" id="useSpark"
+                   {% if config and config.spark %}checked{% endif %} />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="useSpark" style="font-weight:600;">
+            &#9889; Run on <strong>Spark</strong>
+            <span style="font-weight:400;color:#6b7a90;font-size:11px;margin-left:6px;">— uses PySpark JDBC instead of Pandas</span>
+          </label>
+        </div>
+      </div>
+
+      <!-- ── STEP 2: Source ── -->
+      <div class="card form-step" data-step="1">
+        <div class="card-title">Source Configuration</div>
+
+        {# ── Spark configuration panel (shown only when Spark toggle is on) ── #}
+        <div id="sparkConfigPanel" style="display:none;background:#f0f7ff;border:1px solid #bfdbfe;border-radius:8px;padding:16px;margin-bottom:20px;">
+          <div style="font-weight:600;color:#1e40af;margin-bottom:12px;">&#9889; Spark Configuration</div>
+          <div class="form-grid">
+            <div class="form-field">
+              <label>Spark Master</label>
+              <input name="spark_master" value="{{ config.spark.master if config and config.spark else 'local[*]' }}" placeholder="local[*] or spark://host:7077" />
+              <span class="field-hint">local[*] for local mode; spark://host:7077 for cluster</span>
+            </div>
+            <div class="form-field">
+              <label>App Name</label>
+              <input name="spark_app_name" value="{{ config.spark.app_name if config and config.spark else '' }}" placeholder="my_etl_job" />
+            </div>
+            <div class="form-field">
+              <label>Driver Memory</label>
+              <input name="spark_driver_memory" value="{{ config.spark.driver_memory if config and config.spark else '1g' }}" placeholder="1g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Memory</label>
+              <input name="spark_executor_memory" value="{{ config.spark.executor_memory if config and config.spark else '2g' }}" placeholder="2g" />
+            </div>
+            <div class="form-field">
+              <label>Executor Cores</label>
+              <input name="spark_executor_cores" type="number" min="1" value="{{ config.spark.executor_cores if config and config.spark else 2 }}" />
+            </div>
+            <div class="form-field">
+              <label>Num Executors</label>
+              <input name="spark_num_executors" type="number" min="1" value="{{ config.spark.num_executors if config and config.spark else 2 }}" />
+            </div>
+          </div>
+        </div>
+
+        <div class="form-grid">
+
+          {# ── DEV source — shown when env is dev or both ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Source — Dev</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="dev_source_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.source.dev.source_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_source_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.source.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="dev_hwm_column" value="{{ config.source.dev.incremental_column if config else '' }}" placeholder="e.g. updated_at" />
+            <span class="field-hint">Required for incremental loads. Leave blank only for full-reload pipelines — every run will re-load all rows.</span>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Datatype</label>
+            <select name="dev_hwm_datatype">
+              {% for dt in ['date','datetime','timestamp','int','bigint'] %}
+              <option value="{{ dt }}" {% if config and config.source.dev.incremental_column_datatype == dt %}selected{% endif %}>{{ dt }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Date Format</label>
+            <select name="dev_hwm_date_format">
+              <option value="">(auto-detect)</option>
+              {% set _dfmt = config.source.dev.incremental_column_date_format if config else '' %}
+              {% for fmt in ['DD/MM/YYYY','MM/DD/YYYY','YYYY-MM-DD','YYYY/MM/DD','DD-MM-YYYY','MM-DD-YYYY','YYYY-MM-DD HH24:MI:SS','DD/MM/YYYY HH24:MI:SS','YYYY-MM-DD HH24:MI:SS.MS','YYYY-MM-DD HH24:MI:SS.US'] %}
+              <option value="{{ fmt }}" {% if _dfmt == fmt %}selected{% endif %}>{{ fmt }}</option>
+              {% endfor %}
+            </select>
+            <span class="field-hint">Only needed when the HWM column stores dates as text. Use .MS/.US suffix for millisecond/microsecond precision.</span>
+          </div>
+
+          <div class="form-field">
+            <label>Batch Size</label>
+            <input name="dev_batch_size" value="{{ config.source.dev.batch_size if config else 0 }}" />
+          </div>
+
+          <div class="form-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="dev_full_load" {% if config and config.source.dev.full_load %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label>Full Load</label>
+            </div>
+          </div>
+
+          <div class="form-field span-3">
+            <label>SQL Query (Dev)</label>
+            <div class="sql-window">
+              <div class="sql-toolbar">
+                <div class="sql-toolbar-left">
+                  <span class="sql-toolbar-title">DEV Query Editor</span>
+                  <button type="button" class="sql-toolbar-btn" data-sql-action="copy" data-editor="dev_sql_text">Copy</button>
+                  <button type="button" class="sql-toolbar-btn" data-sql-action="clear" data-editor="dev_sql_text">Clear</button>
+                </div>
+              </div>
+              <textarea name="dev_sql_text" rows="8" placeholder="SELECT * FROM schema.table WHERE ...">{{ dev_sql_text or '' }}</textarea>
+            </div>
+          </div>
+          {% endif %}
+
+          {# ── PROD source — shown when env is prod or both ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Source — Prod</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="prod_source_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.source.prod.source_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_source_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.source.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="prod_hwm_column" value="{{ config.source.prod.incremental_column if config else '' }}" placeholder="e.g. updated_at" />
+            <span class="field-hint">Required for incremental loads. Leave blank only for full-reload pipelines — every run will re-load all rows.</span>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Datatype</label>
+            <select name="prod_hwm_datatype">
+              {% for dt in ['date','datetime','timestamp','int','bigint'] %}
+              <option value="{{ dt }}" {% if config and config.source.prod.incremental_column_datatype == dt %}selected{% endif %}>{{ dt }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>HWM Date Format</label>
+            <select name="prod_hwm_date_format">
+              <option value="">(auto-detect)</option>
+              {% set _pfmt = config.source.prod.incremental_column_date_format if config else '' %}
+              {% for fmt in ['DD/MM/YYYY','MM/DD/YYYY','YYYY-MM-DD','YYYY/MM/DD','DD-MM-YYYY','MM-DD-YYYY','YYYY-MM-DD HH24:MI:SS','DD/MM/YYYY HH24:MI:SS','YYYY-MM-DD HH24:MI:SS.MS','YYYY-MM-DD HH24:MI:SS.US'] %}
+              <option value="{{ fmt }}" {% if _pfmt == fmt %}selected{% endif %}>{{ fmt }}</option>
+              {% endfor %}
+            </select>
+            <span class="field-hint">Only needed when the HWM column stores dates as text. Use .MS/.US suffix for millisecond/microsecond precision.</span>
+          </div>
+
+          <div class="form-field">
+            <label>Batch Size</label>
+            <input name="prod_batch_size" value="{{ config.source.prod.batch_size if config else 0 }}" />
+          </div>
+
+          <div class="form-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="prod_full_load" {% if config and config.source.prod.full_load %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label>Full Load</label>
+            </div>
+          </div>
+
+          <div class="form-field span-3">
+            <label>SQL Query (Prod)</label>
+            <div class="sql-window">
+              <div class="sql-toolbar">
+                <div class="sql-toolbar-left">
+                  <span class="sql-toolbar-title">PROD Query Editor</span>
+                  <button type="button" class="sql-toolbar-btn" data-sql-action="copy" data-editor="prod_sql_text">Copy</button>
+                  <button type="button" class="sql-toolbar-btn" data-sql-action="clear" data-editor="prod_sql_text">Clear</button>
+                </div>
+              </div>
+              <textarea name="prod_sql_text" rows="8" placeholder="SELECT * FROM schema.table WHERE ...">{{ prod_sql_text or '' }}</textarea>
+            </div>
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 3: Target ── -->
+      <div class="card form-step" data-step="2">
+        <div class="card-title">Target Configuration</div>
+        <div class="form-grid">
+
+          {# ── DEV target ── #}
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Target — Dev</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="dev_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.dev.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Load Strategy</label>
+            <select name="dev_load_strategy">
+              {% for ls in ['append','replace'] %}
+              <option value="{{ ls }}" {% if config and config.target.dev.load_strategy == ls %}selected{% endif %}>{{ ls }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Target Schema</label>
+            <input name="dev_target_schema" value="{{ config.target.dev.target_schema if config else '' }}" placeholder="e.g. public" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table</label>
+            <input name="dev_target_table" value="{{ config.target.dev.target_table if config else '' }}" placeholder="e.g. entity_sales" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="dev_target_hwm_column" value="{{ config.target.dev.hwm_column if config else '' }}" />
+          </div>
+          {% endif %}
+
+          {# ── PROD target ── #}
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Target — Prod</div>
+
+          <div class="form-field">
+            <label>Connection ID</label>
+            <select name="prod_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.prod.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Load Strategy</label>
+            <select name="prod_load_strategy">
+              {% for ls in ['append','replace'] %}
+              <option value="{{ ls }}" {% if config and config.target.prod.load_strategy == ls %}selected{% endif %}>{{ ls }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Target Schema</label>
+            <input name="prod_target_schema" value="{{ config.target.prod.target_schema if config else '' }}" />
+          </div>
+
+          <div class="form-field">
+            <label>Target Table</label>
+            <input name="prod_target_table" value="{{ config.target.prod.target_table if config else '' }}" />
+          </div>
+
+          <div class="form-field">
+            <label>HWM Column</label>
+            <input name="prod_target_hwm_column" value="{{ config.target.prod.hwm_column if config else '' }}" />
+          </div>
+          {% endif %}
+
+        </div>
+      </div>
+
+      <!-- ── STEP 4: Data Dictionary ── -->
+      <div class="card form-step" data-step="3">
+        <div class="card-title">&#128218; Data Dictionary</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+          Describe each column in the destination table. Stored in the config JSON and surfaced on
+          the <a href="{{ url_for('catalog') }}" target="_blank">Data Catalog</a> for join
+          suggestions and AI analytics. Optional — can be filled in later.
+        </p>
+
+        <!-- Table description -->
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">Table Description</label>
+          <div style="display:flex;gap:8px;align-items:flex-start;">
+            <textarea name="table_description" id="tableDescInput"
+              rows="2"
+              placeholder="Briefly describe what this table contains and its business purpose…"
+              style="flex:1;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;resize:vertical;line-height:1.5;font-family:inherit;">{{ table_description_val | default('') }}</textarea>
+            <button type="button" id="suggestTableDescBtn"
+              title="Let AI write a description based on the table name and columns"
+              style="display:inline-flex;align-items:center;gap:5px;padding:7px 12px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#127775; AI Fill</button>
+          </div>
+          <span id="tableDescStatus" style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;"></span>
+        </div>
+
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">
+            Business Date Column <span style="font-weight:400;color:#6b7a90;">(optional)</span>
+          </label>
+          <input name="business_date_column" id="businessDateColumn"
+            value="{{ business_date_column_val | default('') }}"
+            placeholder="e.g. report_date, invoice_date, reading_datetime"
+            style="width:100%;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-family:inherit;" />
+          <span style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;">
+            The column that says how current the data itself is — shown as
+            <strong>Business Date</strong> on the monitoring dashboard.
+          </span>
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+          <button type="button" id="addDdRow" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#10b981;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">+ Add Column</button>
+          <button type="button" id="loadFromQueryBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#0ea5e9;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#11015; Load from Query</button>
+          <button type="button" id="suggestAiBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#127775; Suggest with AI</button>
+          <span id="aiStatus" style="font-size:12px;color:#6b7a90;"></span>
+        </div>
+
+        <table class="col-table" id="ddTable">
+          <thead>
+            <tr>
+              <th style="width:22%;">Column Name</th>
+              <th style="width:12%;">Data Type</th>
+              <th>Description</th>
+              <th style="width:16%;">Date Format</th>
+              <th style="width:38px;"></th>
+            </tr>
+          </thead>
+          <tbody id="ddBody"></tbody>
+        </table>
+
+      </div>
+
+      <!-- ── STEP 5: Review ── -->
+      <div class="card form-step" data-step="4">
+        <div class="card-title">Review &amp; Save</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:12px;">Review your settings across all steps, then click <strong>Save</strong>.</p>
+        <div id="reviewSummary" style="font-size:12px;line-height:1.8;color:#444;"></div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="form-actions">
+        <button class="btn btn-secondary" type="button" id="prevBtn">&#8592; Back</button>
+        <button class="btn btn-primary"   type="button" id="nextBtn">Next &#8594;</button>
+        <button class="btn btn-primary"   type="submit"  id="saveBtn">&#10003; Save</button>
+        <a      class="btn btn-secondary" href="{{ url_for('jobs') }}">&#10005; Cancel</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+
+<script>
+  const steps     = Array.from(document.querySelectorAll('.form-step'));
+  const tabs      = Array.from(document.querySelectorAll('.step-tab'));
+  const nextBtn   = document.getElementById('nextBtn');
+  const prevBtn   = document.getElementById('prevBtn');
+  const saveBtn   = document.getElementById('saveBtn');
+  let current = 0;
+
+  function renderStep() {
+    steps.forEach((s, i) => s.style.display = i === current ? 'block' : 'none');
+    tabs.forEach((t, i)  => t.classList.toggle('active', i === current));
+    prevBtn.style.display = current === 0 ? 'none' : 'inline-flex';
+    nextBtn.style.display = current === steps.length - 1 ? 'none' : 'inline-flex';
+    saveBtn.style.display = current === steps.length - 1 ? 'inline-flex' : 'none';
+    if (current === steps.length - 1) buildReview();
+  }
+
+  function buildReview() {
+    const dagId = document.querySelector('[name=dag_id]').value;
+    const sched = document.getElementById('scheduleInterval').value;
+    const tags  = (document.querySelector('[name=created_by]').value +
+                  (document.querySelector('[name=extra_tags]').value ? ', ' + document.querySelector('[name=extra_tags]').value : ''));
+    const activeEnv = '{{ active_env or "both" }}';
+    const devConn  = document.querySelector('[name=dev_source_db_conn_id]');
+    const prodConn = document.querySelector('[name=prod_source_db_conn_id]');
+    const ddRows   = Array.from(document.querySelectorAll('#ddBody tr'));
+    const ddCount  = ddRows.filter(r => r.querySelector('[name="dd_col[]"]') && r.querySelector('[name="dd_col[]"]').value.trim()).length;
+    document.getElementById('reviewSummary').innerHTML =
+      '<b>DAG ID:</b> ' + (dagId||'—') + '<br>' +
+      '<b>Schedule:</b> ' + (sched||'—') + '<br>' +
+      '<b>Environment:</b> ' + activeEnv + '<br>' +
+      '<b>Tags:</b> ' + (tags||'—') + '<br>' +
+      (devConn  ? '<b>Source Dev Conn:</b> '  + (devConn.value||'—')  + '<br>' : '') +
+      (prodConn ? '<b>Source Prod Conn:</b> ' + (prodConn.value||'—') + '<br>' : '') +
+      '<b>Dictionary columns:</b> ' + ddCount + '<br>';
+  }
+
+  tabs.forEach(t => t.addEventListener('click', () => {
+    current = parseInt(t.dataset.idx);
+    renderStep();
+  }));
+
+  nextBtn.addEventListener('click', () => { if (current < steps.length-1) { current++; renderStep(); } });
+  prevBtn.addEventListener('click', () => { if (current > 0) { current--; renderStep(); } });
+
+  // Schedule picker → sync to cron input
+  const picker = document.getElementById('schedulePicker');
+  const schedInp = document.getElementById('scheduleInterval');
+  if (picker && schedInp) {
+    Array.from(picker.options).forEach(o => { if (o.value === schedInp.value) picker.value = o.value; });
+    picker.addEventListener('change', () => { if (picker.value) schedInp.value = picker.value; });
+  }
+
+  // Spark toggle → show/hide Spark config panel
+  const sparkToggle = document.getElementById('useSpark');
+  const sparkPanel  = document.getElementById('sparkConfigPanel');
+  function syncSparkPanel() {
+    if (!sparkPanel) return;
+    sparkPanel.style.display = sparkToggle && sparkToggle.checked ? 'block' : 'none';
+  }
+  if (sparkToggle) { sparkToggle.addEventListener('change', syncSparkPanel); syncSparkPanel(); }
+
+  // ── Data Dictionary ──────────────────────────────────────────────────────
+  const ddBody  = document.getElementById('ddBody');
+  const existingDd = {{ data_dictionary_json | safe }};
+
+  const DD_TYPES = ['', 'text', 'integer', 'decimal', 'timestamp', 'boolean', 'date', 'json'];
+  const DATE_FORMATS = ['', 'DD/MM/YYYY', 'MM/DD/YYYY', 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD-MM-YYYY',
+                        'YYYY-MM-DD HH24:MI:SS', 'DD/MM/YYYY HH24:MI:SS', 'MM/DD/YYYY HH24:MI:SS',
+                        'YYYY-MM-DD HH24:MI:SS.MS', 'YYYY-MM-DD HH24:MI:SS.US'];
+  const DATE_TYPES = new Set(['date', 'timestamp']);
+
+  function toggleFmtCell(dtypeSelect) {
+    const row    = dtypeSelect.closest('tr');
+    const sel    = row.querySelector('[name="dd_date_fmt[]"]');
+    const isDate = DATE_TYPES.has(dtypeSelect.value);
+    sel.style.display = isDate ? '' : 'none';
+    if (!isDate) sel.value = '';
+  }
+
+  function escAttr(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  }
+
+  function makeDdRow(col, dtype, desc, dateFmt) {
+    dateFmt = dateFmt || '';
+    const showFmt = DATE_TYPES.has(dtype);
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input name="dd_col[]" value="${escAttr(col)}" placeholder="column_name"
+           style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+      <td><select name="dd_dtype[]" style="width:100%;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid #d1d5db;" onchange="toggleFmtCell(this)">
+        ${DD_TYPES.map(t => `<option value="${t}"${dtype===t?' selected':''}>${t||'—'}</option>`).join('')}
+      </select></td>
+      <td><input name="dd_desc[]" value="${escAttr(desc)}" placeholder="Brief description…"
+           style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+      <td class="dd-fmt-cell">
+        <select name="dd_date_fmt[]" style="width:100%;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid #d1d5db;display:${showFmt ? '' : 'none'}">
+          ${DATE_FORMATS.map(f => `<option value="${f}"${dateFmt===f?' selected':''}>${f||'—'}</option>`).join('')}
+        </select>
+      </td>
+      <td><button type="button" title="Remove" onclick="this.closest('tr').remove()"
+           style="background:none;border:none;cursor:pointer;color:#dc2626;font-size:17px;line-height:1;">&#215;</button></td>
+    `;
+    return tr;
+  }
+
+  // Pipeline metadata columns are injected by the ETL at load time — never
+  // user-defined, so exclude them from the Data Dictionary table.
+  const PIPELINE_META_COLS = new Set([
+    '_pipeline_inserted_at', '_pipeline_run_id', '_source_system',
+    '_loaded_at', '_row_checksum', '_source_file', '_file_checksum',
+  ]);
+
+  // Pre-populate from saved config
+  Object.entries(existingDd).forEach(([col, info]) => {
+    if (PIPELINE_META_COLS.has(col)) return;
+    const desc    = typeof info === 'string' ? info : (info.description || '');
+    const dtype   = (info && typeof info === 'object') ? (info.dtype || '') : '';
+    const dateFmt = (info && typeof info === 'object') ? (info.date_format || '') : '';
+    ddBody.appendChild(makeDdRow(col, dtype, desc, dateFmt));
+  });
+
+  document.getElementById('addDdRow').addEventListener('click', () => {
+    ddBody.appendChild(makeDdRow('', '', ''));
+    ddBody.lastElementChild.querySelector('input').focus();
+  });
+
+  // ── AI suggest table description ─────────────────────────────────────
+  document.getElementById('suggestTableDescBtn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('tableDescStatus');
+    const dagId = (document.querySelector('[name=dag_id]') || {}).value || '';
+    const colInputs = Array.from(document.querySelectorAll('[name="dd_col[]"]'));
+    const cols = colInputs.map(i => i.value.trim()).filter(Boolean);
+    statusEl.style.color = '#6b7a90';
+    statusEl.textContent = '⏳ Asking AI…';
+    try {
+      const resp = await fetch('/api/suggest-descriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({columns: cols, table: dagId, describe_table: true}),
+      });
+      const data = await resp.json();
+      if (data.error) { statusEl.style.color='#b91c1c'; statusEl.textContent='✗ '+data.error; return; }
+      if (data.table_description) {
+        document.getElementById('tableDescInput').value = data.table_description;
+        statusEl.style.color = '#15803d';
+        statusEl.textContent = '✓ Table description filled';
+      } else {
+        statusEl.style.color = '#b45309';
+        statusEl.textContent = '⚠ No description returned';
+      }
+    } catch(e) { statusEl.style.color='#b91c1c'; statusEl.textContent='✗ '+e.message; }
+  });
+
+  document.getElementById('suggestAiBtn').addEventListener('click', async () => {
+    const colInputs = Array.from(document.querySelectorAll('[name="dd_col[]"]'));
+    const cols = colInputs.map(i => i.value.trim()).filter(Boolean);
+    const statusEl = document.getElementById('aiStatus');
+    if (!cols.length) {
+      statusEl.style.color = '#b45309';
+      statusEl.textContent = '\u26a0 Add column names first, then click Suggest.';
+      return;
+    }
+    const dagId = (document.querySelector('[name=dag_id]') || {}).value || '';
+    statusEl.style.color = '#6b7a90';
+    statusEl.textContent = '\u23f3 Asking AI\u2026';
+    try {
+      const resp = await fetch('/api/suggest-descriptions', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({columns: cols, table: dagId}),
+      });
+      const data = await resp.json();
+      if (data.error) {
+        statusEl.style.color = '#b91c1c';
+        statusEl.textContent = '\u2717 ' + data.error;
+        return;
+      }
+      colInputs.forEach(inp => {
+        const col = inp.value.trim();
+        const suggestion = data.suggestions[col];
+        if (suggestion) {
+          const row       = inp.closest('tr');
+          const desc      = typeof suggestion === 'string' ? suggestion : (suggestion.description || '');
+          const dtype     = typeof suggestion === 'object' ? (suggestion.dtype || '') : '';
+          const dateFmt   = typeof suggestion === 'object' ? (suggestion.date_format || '') : '';
+          row.querySelector('[name="dd_desc[]"]').value = desc;
+          const dtypeSel = row.querySelector('[name="dd_dtype[]"]');
+          if (dtype) { dtypeSel.value = dtype; toggleFmtCell(dtypeSel); }
+          if (dateFmt) {
+            const fmtSel = row.querySelector('[name="dd_date_fmt[]"]');
+            if (fmtSel) fmtSel.value = dateFmt;
+          }
+        }
+      });
+      statusEl.style.color = '#15803d';
+      statusEl.textContent = '\u2713 Descriptions & types updated';
+    } catch (e) {
+      statusEl.style.color = '#b91c1c';
+      statusEl.textContent = '\u2717 ' + e.message;
+    }
+  });
+
+  document.getElementById('loadFromQueryBtn').addEventListener('click', async () => {
+    const statusEl = document.getElementById('aiStatus');
+    const connEl = document.querySelector('[name="dev_source_db_conn_id"]') || document.querySelector('[name="prod_source_db_conn_id"]');
+    const sqlEl  = document.querySelector('[name="dev_sql_text"]') || document.querySelector('[name="prod_sql_text"]');
+    const conn_id = connEl ? connEl.value.trim() : '';
+    const sql     = sqlEl  ? sqlEl.value.trim()  : '';
+    if (!conn_id) { statusEl.style.color='#b45309'; statusEl.textContent='\u26a0 Select a source connection first (Step 2).'; return; }
+    if (!sql)     { statusEl.style.color='#b45309'; statusEl.textContent='\u26a0 Enter a SQL query first (Step 2/3).'; return; }
+    statusEl.style.color='#6b7a90'; statusEl.textContent='\u23f3 Fetching columns\u2026';
+    try {
+      const resp = await fetch('/api/columns-from-query', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({conn_id, sql}),
+      });
+      const data = await resp.json();
+      if (data.error) { statusEl.style.color='#b91c1c'; statusEl.textContent='\u2717 ' + data.error; return; }
+      ddBody.innerHTML = '';
+      data.columns.forEach(c => ddBody.appendChild(makeDdRow(c.name, c.type, '', '')));
+      statusEl.style.color='#15803d'; statusEl.textContent='\u2713 ' + data.columns.length + ' columns loaded';
+    } catch(e) { statusEl.style.color='#b91c1c'; statusEl.textContent='\u2717 ' + e.message; }
+  });
+
+  renderStep();
+</script>
+
+<!-- CodeMirror SQL syntax highlighting -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js" integrity="sha512-45GGRcFVSNYgdAPGQR6aWFnFWrBXvH/Fhv5opFTvJGHBRrZaGffLIAMjZKNQGN3RspTa1sTpEzqPLiuEJk8A==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/sql/sql.min.js" integrity="sha512-JOURLWM9HnGQqYASfZSGCKDpJInlbhHCfpQbzPMJAFWqGqXJasTHVNELQ9X7UXVuATZXQmwFPRqLhzb7LWCg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/comment/comment.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/sql-formatter/15.6.0/sql-formatter.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+<script>
+  // ── CodeMirror SQL editors ────────────────────────────────────────────────
+  const sqlEditors = {};
+
+  function initSqlEditor(name) {
+    const ta = document.querySelector('[name="' + name + '"]');
+    if (!ta) return null;
+    const cm = CodeMirror.fromTextArea(ta, {
+      mode: 'text/x-sql',
+      theme: 'default',
+      lineNumbers: true,
+      styleActiveLine: true,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      indentWithTabs: false,
+      tabSize: 2,
+      lineWrapping: true,
+      extraKeys: {
+        'Ctrl-/': 'toggleComment',
+        'Cmd-/':  'toggleComment',
+      },
+    });
+    // Keep the underlying textarea value in sync so existing form logic works
+    cm.on('change', function() { cm.save(); });
+    // Auto-format SQL when the editor loses focus
+    cm.on('blur', function() {
+      const raw = cm.getValue().trim();
+      if (!raw || !window.sqlFormatter) return;
+      try {
+        const formatted = window.sqlFormatter.format(raw, {
+          language: 'postgresql',
+          keywordCase: 'upper',
+          linesBetweenQueries: 1,
+        });
+        if (formatted !== raw) {
+          const cursor = cm.getCursor();
+          cm.setValue(formatted);
+          cm.setCursor(cursor);
+          cm.save();
+        }
+      } catch (e) {}
+    });
+    return cm;
+  }
+
+  sqlEditors.dev  = initSqlEditor('dev_sql_text');
+  sqlEditors.prod = initSqlEditor('prod_sql_text');
+
+  function withEditor(name, cb) {
+    const cm = sqlEditors[name];
+    if (!cm) return;
+    cb(cm);
+    cm.focus();
+    cm.save();
+  }
+
+  document.querySelectorAll('[data-sql-action]').forEach(function(btn) {
+    btn.addEventListener('click', async function() {
+      const action = btn.dataset.sqlAction;
+      const editorName = btn.dataset.editor;
+      withEditor(editorName, function(cm) {
+        if (action === 'clear') {
+          cm.setValue('');
+          return;
+        }
+        if (action === 'copy') {
+          navigator.clipboard.writeText(cm.getValue());
+          return;
+        }
+      });
+    });
+  });
+
+  // Ensure textarea values are flushed on submit
+  document.getElementById('jobForm').addEventListener('submit', function() {
+    Object.values(sqlEditors).forEach(function(cm) { if (cm) cm.save(); });
+  });
+</script>
+</main>
+</body>
+</html>

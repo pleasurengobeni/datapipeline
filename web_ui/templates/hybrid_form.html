@@ -1,0 +1,2183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>{{ 'Edit' if config else 'New' }} Hybrid Pipeline Job</title>
+  <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo.png', v=app_version) }}" />
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css', v=app_version) }}" />
+  <style>
+    /* ── Column actions table ── */
+    .col-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .col-table th { background:#f3f4f6; padding:7px 10px; text-align:left; font-weight:600; color:#374151; border-bottom:2px solid #e5e7eb; }
+    .col-table td { padding:7px 10px; border-bottom:1px solid #f0f0f0; vertical-align:middle; }
+    .col-table tr:hover td { background:#f9fafb; }
+    .col-table select, .col-table input[type=text] { font-size:11px; padding:3px 6px; border-radius:4px; border:1px solid #d1d5db; background:#fff; }
+    .col-table input[type=text] { width:100px; }
+    .col-sample { color:#9ca3af; font-size:10px; font-style:italic; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+    /* ── Rule pills ── */
+    .rule-pills { display:flex; flex-wrap:wrap; gap:3px; }
+    .rule-pill {
+      display:inline-block; padding:2px 8px; border-radius:10px; font-size:10px; font-weight:600;
+      cursor:pointer; border:1px solid #d1d5db; background:#f9fafb; color:#6b7280;
+      transition:all .15s; user-select:none; white-space:nowrap;
+    }
+    .rule-pill:hover { background:#e5e7eb; border-color:#9ca3af; }
+    .rule-pill.active { background:#dbeafe; border-color:#93c5fd; color:#1d4ed8; }
+
+    /* ── Exclude toggle ── */
+    .exclude-toggle { cursor:pointer; }
+    .col-excluded td { opacity:.45; }
+    .col-excluded td:last-child { opacity:1; }
+
+    /* ── Cleaning SQL preview ── */
+    .sql-preview { background:#1e1e2e; color:#cdd6f4; border-radius:8px; padding:14px 16px; font-family:monospace; font-size:11px; line-height:1.7; overflow-x:auto; white-space:pre; }
+    .sql-line-key { color:#89b4fa; }
+
+    /* ── Source type toggle ── */
+    .src-type-btn {
+      padding:8px 20px; border-radius:6px; border:2px solid #e5e7eb; background:#f9fafb;
+      font-size:12px; font-weight:600; cursor:pointer; color:#374151; transition:all .15s;
+    }
+    .src-type-btn.active { border-color:#6366f1; background:#eef2ff; color:#4338ca; }
+
+    /* ── Manual SQL rows ── */
+    .manual-sql-row { display:flex; gap:8px; margin-bottom:8px; align-items:flex-start; }
+    .manual-sql-row textarea { flex:1; font-family:monospace; font-size:12px; padding:7px 10px;
+      border:1px solid #d1d5db; border-radius:6px; resize:vertical; min-height:48px; }
+    .manual-sql-row button { flex-shrink:0; padding:6px 10px; background:#fef2f2; color:#dc2626; border:1px solid #fca5a5; border-radius:6px; cursor:pointer; font-size:12px; }
+
+    /* ── Pipeline flow badge ── */
+    .pipeline-flow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:11px; font-weight:600; margin-bottom:16px; }
+    .flow-node { padding:4px 12px; border-radius:20px; }
+    .flow-file  { background:#f0fdf4; color:#166534; border:1px solid #86efac; }
+    .flow-raw   { background:#fff7ed; color:#9a3412; border:1px solid #fdba74; }
+    .flow-refine{ background:#fdf4ff; color:#7e22ce; border:1px solid #d8b4fe; }
+    .flow-dw    { background:#eff6ff; color:#1e40af; border:1px solid #93c5fd; }
+    .flow-arrow { color:#9ca3af; }
+
+    .hint-block { background:#fffbeb; border:1px solid #fde68a; border-radius:6px; padding:10px 14px; font-size:12px; color:#92400e; margin-bottom:14px; line-height:1.6; }
+
+    /* ── Auth-type / pagination-strategy conditional panels (API source) ──
+       Only the panel matching the selected dropdown value should ever be
+       visible — the JS toggles the "active" class, this is what actually
+       hides the rest. */
+    .auth-panel, .pag-panel { display:none; }
+    .auth-panel.active, .pag-panel.active { display:grid; }
+    .pag-chip-row { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+    .pag-chip { padding:5px 10px; background:#f9fafb; color:#374151; border:1px solid #d1d5db; border-radius:12px; font-size:12px; cursor:pointer; }
+    .pag-chip:hover { background:#eef2ff; border-color:#8b5cf6; }
+
+    /* ── Test Connection result panel (API source) ── */
+    .test-result { margin-top:14px; border-radius:8px; padding:12px 16px; font-size:12px; display:none; }
+    .test-result.ok    { background:#f0fdf4; border:1px solid #86efac; color:#166534; }
+    .test-result.error { background:#fef2f2; border:1px solid #fca5a5; color:#b91c1c; }
+    .sample-raw { background:#1e1e2e; color:#cdd6f4; border-radius:8px; padding:12px 14px; font-family:monospace;
+      font-size:11px; line-height:1.6; overflow:auto; max-height:260px; white-space:pre; margin-top:10px; }
+    .secret-hint { font-size:11px; color:#9ca3af; display:block; margin-top:3px; }
+
+    .env-banner { display:flex; align-items:center; gap:8px; padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; margin-bottom:14px; }
+    .env-banner.dev  { background:#dcfce7; color:#15803d; border:1px solid #86efac; }
+    .env-banner.prod { background:#fef9c3; color:#92400e; border:1px solid #fde68a; }
+    .env-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+    .env-banner.dev  .env-dot { background:#22c55e; }
+    .env-banner.prod .env-dot { background:#f59e0b; }
+  </style>
+</head>
+<body>
+<div class="app-shell">
+
+  <nav class="navbar">
+    <a class="navbar-brand" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='logo.png', v=app_version) }}" alt="ETL" class="navbar-logo" /></a>
+    <div class="navbar-right">
+      <div class="navbar-user">
+        <div class="navbar-avatar">{{ user[1][0]|upper }}</div>
+        {{ user[1] }}
+      </div>
+      <a href="{{ url_for('catalog') }}">&#128218; Catalog</a>
+      <a href="{{ url_for('profile') }}">Profile</a>
+    </div>
+  </nav>
+
+  <main class="main-content" style="padding:24px;max-width:1100px;margin:0 auto;width:100%;">
+    <div class="page-header">
+      <div style="font-size:12px;color:#6b7a90;margin-bottom:4px;">&#9889; Hybrid Pipeline (3-Stage)</div>
+      <h1>{{ 'Edit Hybrid Job' if config else 'Add a New Hybrid Pipeline Job' }}</h1>
+    </div>
+
+    <div class="pipeline-flow">
+      <span class="flow-node flow-file">&#128196; File / DB</span>
+      <span class="flow-arrow">&#8594;</span>
+      <span class="flow-node flow-raw">raw.*_raw (permanent)</span>
+      <span class="flow-arrow">&#8594;</span>
+      <span class="flow-node flow-refine">pipeline.*_refined</span>
+      <span class="flow-arrow">&#8594;</span>
+      <span class="flow-node flow-dw">&#127968; Data Warehouse</span>
+    </div>
+
+    {% if active_env == 'dev' %}
+    <div class="env-banner dev"><span class="env-dot"></span> Editing <strong>DEV</strong> environment &mdash; prod settings are preserved.</div>
+    {% elif active_env == 'prod' %}
+    <div class="env-banner prod"><span class="env-dot"></span> Editing <strong>PROD</strong> environment &mdash; dev settings are preserved.</div>
+    {% endif %}
+
+    <div id="saveErrorBanner" style="display:none;margin-bottom:14px;padding:12px 16px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#b91c1c;font-size:13px;font-weight:600;"></div>
+    {% if save_error %}
+    <div style="margin-bottom:14px;padding:12px 16px;background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;color:#b91c1c;font-size:13px;font-weight:600;">
+      &#9888; Save failed: {{ save_error }}
+    </div>
+    {% endif %}
+
+    <form method="post" action="{{ url_for('new_hybrid_job') if not config else url_for('edit_hybrid_job', dag_id=config.dag_id) }}" id="hybridForm">
+
+      {% if active_env == 'dev' and config %}
+        <input type="hidden" name="prod_watch_path"            value="{{ config.source.prod.watch_path or incoming_dir }}" />
+        <input type="hidden" name="prod_file_name"             value="" />
+        <input type="hidden" name="prod_archive_path"          value="{{ config.source.prod.archive_path or archive_dir }}" />
+        <input type="hidden" name="prod_archive_retention_days" value="{{ config.source.prod.archive_retention_days or 30 }}" />
+        <input type="hidden" name="prod_file_format"           value="{{ config.source.prod.file_format or 'csv' }}" />
+        <input type="hidden" name="prod_delimiter"             value="{{ config.source.prod.delimiter or ',' }}" />
+        <input type="hidden" name="prod_has_header"            value="{{ 'on' if config.source.prod.has_header else '' }}" />
+        <input type="hidden" name="prod_skip_rows"             value="{{ config.source.prod.skip_rows or 0 }}" />
+        <input type="hidden" name="prod_null_values"           value="{{ config.source.prod.null_values | join(',') if config.source.prod.null_values else '' }}" />
+        <input type="hidden" name="prod_target_db_conn_id"     value="{{ config.target.prod.target_db_conn_id or '' }}" />
+        <input type="hidden" name="prod_target_db_type"        value="{{ config.target.prod.db_type or 'postgresql' }}" />
+        <input type="hidden" name="prod_target_schema"         value="{{ config.target.prod.target_schema or '' }}" />
+        <input type="hidden" name="prod_target_table"          value="{{ config.target.prod.target_table or '' }}" />
+      {% endif %}
+
+      <!-- Step Tabs -->
+      <div class="step-tabs" id="stepTabs">
+        <div class="step-tab active" data-idx="0">1. Source</div>
+        <div class="step-tab"        data-idx="1">2. Basics</div>
+        <div class="step-tab"        data-idx="2">3. Columns</div>
+        <div class="step-tab"        data-idx="3">4. Dictionary</div>
+        <div class="step-tab"        data-idx="4">5. Target</div>
+        <div class="step-tab"        data-idx="5">6. Cleaning</div>
+        <div class="step-tab"        data-idx="6">7. Review</div>
+      </div>
+
+      <!-- ────────────────────────── STEP 1: Source ────────────────────────── -->
+      <div class="card form-step" data-step="0">
+        <div class="card-title">Data Source</div>
+
+        <!-- Source type picker -->
+        <div style="margin-bottom:20px;">
+          <div style="font-size:12px;font-weight:600;color:#374151;margin-bottom:8px;">Where does your data come from?</div>
+          <div style="display:flex;gap:10px;">
+            <button type="button" class="src-type-btn active" id="srcTypeFile" onclick="setSourceType('file')">&#128196; File (CSV / Parquet)</button>
+            <button type="button" class="src-type-btn"        id="srcTypeDb"   onclick="setSourceType('db')">&#128421; Database</button>
+            <button type="button" class="src-type-btn"        id="srcTypeApi"  onclick="setSourceType('api')">&#127760; REST API</button>
+          </div>
+          <input type="hidden" name="source_type" id="sourceTypeInput" value="{{ config.source_type if config else 'file' }}" />
+        </div>
+
+        <!-- FILE FIELDS -->
+        <div id="fileFields">
+          <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+            <div style="font-weight:600;color:#0369a1;margin-bottom:6px;">&#128196; Enter the filename — fields will auto-fill and columns will be detected</div>
+            <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;">
+              <div style="flex:1;min-width:200px;position:relative;">
+                <input type="text" id="sampleFileInput" placeholder="Type to filter files…"
+                       value="{{ config.source.dev.file_name if config and config.source_type == 'file' else '' }}"
+                       style="width:100%;box-sizing:border-box;padding:7px 10px;border:1px solid #93c5fd;border-radius:6px;font-size:13px;"
+                       autocomplete="off" />
+                <div id="fileDropdown" style="display:none;position:absolute;top:100%;left:0;right:0;z-index:999;
+                     background:#fff;border:1px solid #93c5fd;border-top:none;border-radius:0 0 6px 6px;
+                     max-height:200px;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.1);"></div>
+              </div>
+              <button type="button" id="detectColsBtn"
+                style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">
+                &#128269; Detect Columns
+              </button>
+              <span id="detectStatus" style="font-size:12px;color:#6b7a90;margin-top:6px;"></span>
+            </div>
+          </div>
+
+          <div class="form-grid">
+            {% if active_env != 'prod' %}
+            <div class="sub-header">File Source — Dev</div>
+            <div class="form-field">
+              <label>File Format</label>
+              <select name="dev_file_format" id="devFileFormat">
+                {% for fmt in ['csv','parquet'] %}
+                <option value="{{ fmt }}" {% if config and config.source.dev.file_format == fmt %}selected{% endif %}>{{ fmt|upper }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <input type="hidden" id="devWatchPath"   name="dev_watch_path"   value="{{ incoming_dir }}" />
+            <input type="hidden" id="devFileName"    name="dev_file_name"    value="{{ config.source.dev.file_name if config else '' }}" />
+            <input type="hidden" id="devArchivePath" name="dev_archive_path" value="{{ archive_dir }}" />
+
+            <div class="form-field">
+              <label>Archive Retention (days)</label>
+              <input name="dev_archive_retention_days" type="number" min="1"
+                     value="{{ config.source.dev.archive_retention_days if config else 30 }}" />
+            </div>
+            <div class="form-field">
+              <label>Delimiter</label>
+              {% set _d = config.source.dev.delimiter if config else ',' %}
+              <select name="dev_delimiter">
+                <option value=","  {% if _d == ',' %}selected{% endif %}>, — Comma</option>
+                <option value="&#9;" {% if _d in ('\t','\\t') %}selected{% endif %}>Tab</option>
+                <option value=";"  {% if _d == ';' %}selected{% endif %}>; — Semicolon</option>
+                <option value="|"  {% if _d == '|' %}selected{% endif %}>| — Pipe</option>
+              </select>
+            </div>
+            <input type="hidden" name="dev_encoding" value="auto" />
+            <div class="form-field" style="justify-content:flex-end;">
+              <div class="toggle-field">
+                <label class="toggle-switch">
+                  <input type="checkbox" name="dev_has_header"
+                         {% if not (config and config.source.dev.has_header == False) %}checked{% endif %} />
+                  <span class="toggle-slider"></span>
+                </label>
+                <label>Has Header Row</label>
+              </div>
+            </div>
+            <div class="form-field">
+              <label>Skip Rows</label>
+              <input name="dev_skip_rows" type="number" min="0" value="{{ config.source.dev.skip_rows if config else 0 }}" />
+            </div>
+            <div class="form-field span-3">
+              <label>Null Value Sentinels (comma-separated)</label>
+              <input name="dev_null_values"
+                     value="{{ config.source.dev.null_values | join(',') if config and config.source.dev.null_values else 'NULL,null,None,NA,N/A,#N/A' }}" />
+            </div>
+            {% endif %}
+          </div>
+        </div>
+
+        <!-- DB FIELDS -->
+        <div id="dbFields" style="display:none;">
+          <div class="form-grid">
+            {% if active_env != 'prod' %}
+            <div class="sub-header">Database Source — Dev</div>
+            <div class="form-field">
+              <label>Source Connection</label>
+              <select name="dev_source_db_conn_id">
+                <option value="">— select —</option>
+                {% for conn in connections %}
+                <option value="{{ conn }}" {% if config and config.source_type == 'db' and config.source.dev.source_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-field">
+              <label>DB Type</label>
+              <select name="dev_source_db_type">
+                {% for db in ['postgresql','mysql','mssql'] %}
+                <option value="{{ db }}" {% if config and config.source_type == 'db' and config.source.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="form-field span-3">
+              <label>SQL Query / Table</label>
+              <textarea name="dev_sql_text" rows="5" placeholder="SELECT * FROM schema.table" style="font-family:monospace;font-size:12px;width:100%;box-sizing:border-box;padding:8px;border:1px solid #d1d5db;border-radius:6px;resize:vertical;"></textarea>
+            </div>
+            {% endif %}
+          </div>
+          <button type="button" id="detectDbColsBtn"
+            style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+            &#128269; Detect Columns from Query
+          </button>
+          <span id="detectDbStatus" style="font-size:12px;color:#6b7a90;margin-left:8px;"></span>
+        </div>
+        <!-- API FIELDS -->
+        <div id="apiFields" style="display:none;">
+      <div class="card">
+        <div class="card-title">API Connection</div>
+
+        <!-- URL mode picker -->
+        <div style="margin-bottom:18px;">
+          <div style="font-size:12px;font-weight:600;color:#374151;margin-bottom:8px;">How do you want to provide the request URL?</div>
+          <div style="display:flex;gap:10px;">
+            <button type="button" class="src-type-btn {{ 'active' if not config or config.source.dev.url_mode != 'full' else '' }}"
+                    id="urlModeSeparate" onclick="setUrlMode('separate')">Base URL + Auth</button>
+            <button type="button" class="src-type-btn {{ 'active' if config and config.source.dev.url_mode == 'full' else '' }}"
+                    id="urlModeFull" onclick="setUrlMode('full')">&#128203; Full URL</button>
+          </div>
+          <input type="hidden" name="dev_url_mode" id="urlModeInput" value="{{ config.source.dev.url_mode if config else 'separate' }}" />
+        </div>
+
+        <!-- SEPARATE mode: Base URL -->
+        <div id="urlModeSeparateFields">
+          <div class="form-grid">
+            <div class="form-field span-2">
+              <label>API URL *</label>
+              <input name="dev_base_url" id="baseUrlInput" placeholder="https://api.example.com/v1/orders"
+                     value="{{ ((config.source.dev.base_url | default('')) + (config.source.dev.data_endpoint | default(''))) if config else '' }}" />
+              <span class="field-hint">The complete request URL, including any path — query parameters go below.</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- FULL mode: one field, the whole URL (token embedded and all) encrypted as-is -->
+        <div id="urlModeFullFields" style="display:none;">
+          <div class="form-field">
+            <label>Full Request URL *</label>
+            <textarea name="dev_full_url" id="fullUrlInput" rows="3"
+              placeholder="Paste the complete URL, including any token/key already in the query string."
+              style="width:100%;box-sizing:border-box;font-family:monospace;font-size:11px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;resize:vertical;">{{ secret_mask if config and config.source.dev.full_url_enc else '' }}</textarea>
+            <span class="secret-hint">&#128274; Stored encrypted as one value — whatever token/key is embedded in it goes with it. Leave the masked value unchanged to keep the current URL.</span>
+          </div>
+        </div>
+
+        <div class="form-grid" style="margin-top:12px;">
+          <div class="form-field">
+            <label>HTTP Method</label>
+            <select name="dev_http_method" id="httpMethodInput">
+              {% for m in ['GET','POST'] %}
+              <option value="{{ m }}" {% if config and config.source.dev.http_method == m %}selected{% endif %}>{{ m }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Timeout (seconds)</label>
+            <input name="dev_timeout_seconds" type="number" min="1"
+                   value="{{ config.source.dev.timeout_seconds if config else 30 }}" />
+          </div>
+        </div>
+
+        <!-- Query params -->
+        <div style="margin-top:16px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">Query Parameters (optional)</label>
+          <div id="paramsList"></div>
+          <button type="button" id="addParamBtn" style="padding:6px 12px;background:#f9fafb;color:#374151;border:1px solid #d1d5db;border-radius:6px;font-size:12px;cursor:pointer;">+ Add Parameter</button>
+          <input type="hidden" name="dev_request_params_json" id="requestParamsJson" value="{{ config.source.dev.request_params | tojson if config and config.source.dev.request_params else '{}' }}" />
+        </div>
+
+        <!-- Headers -->
+        <div style="margin-top:16px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">Extra Headers (optional)</label>
+          <div id="headersList"></div>
+          <button type="button" id="addHeaderBtn" style="padding:6px 12px;background:#f9fafb;color:#374151;border:1px solid #d1d5db;border-radius:6px;font-size:12px;cursor:pointer;">+ Add Header</button>
+          <input type="hidden" name="dev_request_headers_json" id="requestHeadersJson" value="{{ config.source.dev.request_headers | tojson if config and config.source.dev.request_headers else '{}' }}" />
+        </div>
+
+        <!-- Auth — only meaningful in "separate" URL mode; "full" mode's
+             token/key is whatever's embedded in the pasted URL itself. -->
+        <div id="authSection" style="margin-top:22px;border-top:1px solid #e5e7eb;padding-top:16px;">
+          <div class="card-title" style="font-size:13px;">Authentication</div>
+          <div class="form-field" style="max-width:320px;">
+            <label>Auth Type</label>
+            <select name="dev_auth_type" id="authTypeSelect">
+              <option value="none"              {% if config and config.source.dev.auth.type == 'none' %}selected{% endif %}>None</option>
+              <option value="api_key_header"    {% if config and config.source.dev.auth.type == 'api_key_header' %}selected{% endif %}>Static API Key / Bearer Token (header)</option>
+              <option value="api_key_query_param" {% if config and config.source.dev.auth.type == 'api_key_query_param' %}selected{% endif %}>Static API Key / Token (query parameter)</option>
+              <option value="login_token"       {% if config and config.source.dev.auth.type == 'login_token' %}selected{% endif %}>Login Endpoint (fetch a token)</option>
+            </select>
+            <span class="field-hint">Query-parameter tokens are common for ArcGIS/Esri FeatureServer &amp; MapServer REST endpoints (e.g. <code>...&amp;token=...</code>).</span>
+          </div>
+
+          {% set _hdr_custom = config and config.source.dev.auth.header_name and config.source.dev.auth.header_name != 'Authorization' %}
+          <div class="form-grid auth-panel" id="authPanelApiKey">
+            <div class="form-field span-2">
+              <label>API Key / Token</label>
+              <input name="dev_auth_api_key" type="password" autocomplete="new-password"
+                     value="{{ secret_mask if config and config.source.dev.auth.api_key_enc else '' }}"
+                     placeholder="Paste your API key or token" />
+              <span class="secret-hint">&#128274; Stored encrypted. Leave the masked value unchanged to keep the current key. Sent as <code>Authorization: &lt;token&gt;</code> unless customized below.</span>
+            </div>
+            <div class="form-field span-2" id="headerNameToggleWrap" style="{{ 'display:none;' if _hdr_custom else '' }}">
+              <a href="javascript:void(0)" onclick="document.getElementById('headerNameWrap').style.display='';document.getElementById('headerNameToggleWrap').style.display='none';" style="font-size:11px;color:#6366f1;text-decoration:none;">&#9881; Sent as a different header than "Authorization"?</a>
+            </div>
+            <div class="form-field span-2" id="headerNameWrap" style="{{ '' if _hdr_custom else 'display:none;' }}">
+              <label>Header Name</label>
+              <input name="dev_auth_header_name" placeholder="Authorization"
+                     value="{{ config.source.dev.auth.header_name if config and config.source.dev.auth.header_name else '' }}" />
+            </div>
+          </div>
+
+          {% set _param_custom = config and config.source.dev.auth.type == 'api_key_query_param' and config.source.dev.auth.param_name and config.source.dev.auth.param_name != 'token' %}
+          <div class="form-grid auth-panel" id="authPanelApiKeyParam">
+            <div class="form-field span-2">
+              <label>API Key / Token</label>
+              <input name="dev_auth_api_key_param" type="password" autocomplete="new-password"
+                     value="{{ secret_mask if config and config.source.dev.auth.type == 'api_key_query_param' and config.source.dev.auth.api_key_enc else '' }}"
+                     placeholder="Paste your API key or token" />
+              <span class="secret-hint">&#128274; Stored encrypted. Leave the masked value unchanged to keep the current key. Sent as <code>?token=...</code> unless customized below.</span>
+            </div>
+            <div class="form-field span-2" id="paramNameToggleWrap" style="{{ 'display:none;' if _param_custom else '' }}">
+              <a href="javascript:void(0)" onclick="document.getElementById('paramNameWrap').style.display='';document.getElementById('paramNameToggleWrap').style.display='none';" style="font-size:11px;color:#6366f1;text-decoration:none;">&#9881; API expects a different param name than "token"?</a>
+            </div>
+            <div class="form-field span-2" id="paramNameWrap" style="{{ '' if _param_custom else 'display:none;' }}">
+              <label>Query Param Name</label>
+              <input name="dev_auth_param_name" placeholder="token"
+                     value="{{ config.source.dev.auth.param_name if config and config.source.dev.auth.type == 'api_key_query_param' and config.source.dev.auth.param_name else '' }}" />
+            </div>
+          </div>
+
+          <div class="form-grid auth-panel" id="authPanelLoginToken">
+            <div class="form-field span-2">
+              <label>Token Endpoint *</label>
+              <input name="dev_auth_token_endpoint" placeholder="https://api.example.com/auth/login"
+                     value="{{ config.source.dev.auth.token_endpoint if config else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Request Body Type</label>
+              <select name="dev_auth_token_request_body_type">
+                <option value="json" {% if config and config.source.dev.auth.token_request_body_type == 'json' %}selected{% endif %}>JSON</option>
+                <option value="form" {% if config and config.source.dev.auth.token_request_body_type == 'form' %}selected{% endif %}>Form-encoded</option>
+              </select>
+            </div>
+            <div></div>
+            <div class="form-field">
+              <label>Username Field Name</label>
+              <input name="dev_auth_token_username_field" placeholder="username"
+                     value="{{ config.source.dev.auth.token_username_field if config and config.source.dev.auth.token_username_field else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Username</label>
+              <input name="dev_auth_token_username"
+                     value="{{ config.source.dev.auth.token_username if config else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Password Field Name</label>
+              <input name="dev_auth_token_password_field" placeholder="password"
+                     value="{{ config.source.dev.auth.token_password_field if config and config.source.dev.auth.token_password_field else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Password</label>
+              <input name="dev_auth_token_password" type="password" autocomplete="new-password"
+                     value="{{ secret_mask if config and config.source.dev.auth.token_password_enc else '' }}" />
+              <span class="secret-hint">&#128274; Stored encrypted. Leave the masked value unchanged to keep the current password.</span>
+            </div>
+            <div class="form-field">
+              <label>Token Field in Response</label>
+              <input name="dev_auth_token_response_field" placeholder="access_token or data.access_token"
+                     value="{{ config.source.dev.auth.token_response_field if config and config.source.dev.auth.token_response_field else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Auth Header Name</label>
+              <input name="dev_auth_token_header_name" placeholder="Authorization"
+                     value="{{ config.source.dev.auth.token_header_name if config and config.source.dev.auth.token_header_name else '' }}" />
+            </div>
+            <div class="form-field">
+              <label>Auth Header Prefix</label>
+              <input name="dev_auth_token_header_prefix" placeholder="Bearer (with a trailing space) — defaults to this if left blank"
+                     value="{{ config.source.dev.auth.token_header_prefix if config and config.source.dev.auth.token_header_prefix else '' }}" />
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top:20px;">
+          <button type="button" id="testConnBtn"
+            style="display:inline-flex;align-items:center;gap:6px;padding:8px 16px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+            &#9889; Test Connection
+          </button>
+          <span id="testConnStatus" style="font-size:12px;color:#6b7a90;margin-left:10px;"></span>
+          <div id="testConnResult" class="test-result">
+            <div id="testConnSummary"></div>
+            <pre id="testConnSample" class="sample-raw" style="display:none;"></pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Response Format</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:10px;">
+          How records are shaped in the API's response — <strong>Test Connection</strong> above auto-fills these from a
+          heuristic detection. For an ambiguous or deeply-nested shape, ask AI to look at the same sample instead.
+        </p>
+        <div style="margin-bottom:16px;">
+          <button type="button" id="suggestFormatBtn"
+            style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+            &#127775; Suggest with AI
+          </button>
+          <span id="suggestFormatStatus" style="font-size:12px;color:#6b7a90;margin-left:8px;"></span>
+        </div>
+        <div class="form-grid">
+          <div class="form-field">
+            <label>Format</label>
+            <select name="dev_response_format_type" id="responseFormatType">
+              <option value="json_array"       {% if config and config.source.dev.response_format.type == 'json_array' %}selected{% endif %}>JSON array — <code>[{...}, {...}]</code></option>
+              <option value="json_object_path" {% if config and config.source.dev.response_format.type == 'json_object_path' %}selected{% endif %}>JSON object with a nested records list</option>
+              <option value="ndjson"           {% if config and config.source.dev.response_format.type == 'ndjson' %}selected{% endif %}>NDJSON / JSON Lines — one record per line</option>
+            </select>
+          </div>
+          <div class="form-field" id="recordsPathField">
+            <label>Records Path</label>
+            <input name="dev_response_format_records_path" placeholder="e.g. data.results"
+                   value="{{ config.source.dev.response_format.records_path if config and config.source.dev.response_format.records_path else '' }}" />
+            <span class="field-hint">Dotted path to the list of records inside the response object.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Pagination</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:16px;">
+          Some APIs only hand back a limited number of records per request and expect you to ask again for the
+          rest. If yours does that, tell it here how to ask for "the next batch". Not sure? Leave this on
+          <strong>None</strong>, run a test load, and if the result looks cut short, come back and pick the option
+          that matches what your API's documentation calls it.
+        </p>
+        <div class="form-field" style="max-width:340px;margin-bottom:6px;">
+          <label>Strategy</label>
+          <select name="dev_pagination_strategy" id="paginationStrategy">
+            <option value="none"          {% if not config or config.source.dev.pagination.strategy == 'none' %}selected{% endif %}>None — single page / response has everything</option>
+            <option value="offset_limit"  {% if config and config.source.dev.pagination.strategy == 'offset_limit' %}selected{% endif %}>Offset &amp; limit — "skip N, give me M"</option>
+            <option value="page_number"   {% if config and config.source.dev.pagination.strategy == 'page_number' %}selected{% endif %}>Page number — "give me page N"</option>
+            <option value="cursor"        {% if config and config.source.dev.pagination.strategy == 'cursor' %}selected{% endif %}>Cursor / continuation token (advanced)</option>
+            <option value="next_link"     {% if config and config.source.dev.pagination.strategy == 'next_link' %}selected{% endif %}>Next-link in response (advanced)</option>
+          </select>
+        </div>
+        <p id="pagStrategyHelp" style="color:#6b7a90;font-size:12px;margin-bottom:16px;"></p>
+
+        <div class="form-grid pag-panel" id="pagPanelOffsetLimit">
+          <div class="form-field"><label>Page Size</label><input name="dev_pagination_page_size" class="pag-page-size" type="number" min="1" value="{{ config.source.dev.pagination.page_size if config else 100 }}" /><span class="field-hint">How many records to fetch per request.</span></div>
+          <div class="form-field"><label>Offset Param Name</label><input name="dev_pagination_offset_param" class="pag-chip-target" data-chip-field="offset" value="{{ config.source.dev.pagination.offset_param if config and config.source.dev.pagination.offset_param else 'offset' }}" /></div>
+          <div class="form-field"><label>Limit Param Name</label><input name="dev_pagination_limit_param" class="pag-chip-target" data-chip-field="limit" value="{{ config.source.dev.pagination.limit_param if config and config.source.dev.pagination.limit_param else 'limit' }}" /></div>
+          <div class="form-field" style="grid-column:1 / -1;">
+            <span class="field-hint">Not sure what your API calls these? Check its docs, or try a common pair:</span>
+            <div class="pag-chip-row" data-chip-panel="offset_limit"></div>
+          </div>
+        </div>
+
+        <div class="form-grid pag-panel" id="pagPanelPageNumber">
+          <div class="form-field"><label>Page Size</label><input name="dev_pagination_page_size" class="pag-page-size" type="number" min="1" value="{{ config.source.dev.pagination.page_size if config else 100 }}" /><span class="field-hint">How many records per page.</span></div>
+          <div class="form-field"><label>Page Param Name</label><input name="dev_pagination_page_param" class="pag-chip-target" data-chip-field="page" value="{{ config.source.dev.pagination.page_param if config and config.source.dev.pagination.page_param else 'page' }}" /></div>
+          <div class="form-field"><label>Page Size Param Name</label><input name="dev_pagination_page_size_param" class="pag-chip-target" data-chip-field="page_size" value="{{ config.source.dev.pagination.page_size_param if config and config.source.dev.pagination.page_size_param else 'page_size' }}" /></div>
+          <div class="form-field"><label>Start Page</label><input name="dev_pagination_start_page" type="number" min="0" value="{{ config.source.dev.pagination.start_page if config else 1 }}" /><span class="field-hint">The number of the first page — usually 0 or 1.</span></div>
+          <div class="form-field" style="grid-column:1 / -1;">
+            <span class="field-hint">Not sure what your API calls these? Check its docs, or try a common pair:</span>
+            <div class="pag-chip-row" data-chip-panel="page_number"></div>
+          </div>
+        </div>
+
+        <div class="form-grid pag-panel" id="pagPanelCursor">
+          <p style="grid-column:1 / -1;color:#6b7a90;font-size:12px;margin:0 0 4px;">Advanced — the API's response includes a token that must be sent back to fetch the next batch. Get these exact names from the API's documentation.</p>
+          <div class="form-field"><label>Cursor Param Name (request)</label><input name="dev_pagination_cursor_param" value="{{ config.source.dev.pagination.cursor_param if config and config.source.dev.pagination.cursor_param else 'cursor' }}" /></div>
+          <div class="form-field"><label>Cursor Field (response)</label><input name="dev_pagination_cursor_response_field" placeholder="e.g. next_cursor" value="{{ config.source.dev.pagination.cursor_response_field if config and config.source.dev.pagination.cursor_response_field else '' }}" /></div>
+        </div>
+
+        <div class="form-grid pag-panel" id="pagPanelNextLink">
+          <p style="grid-column:1 / -1;color:#6b7a90;font-size:12px;margin:0 0 4px;">Advanced — the API's response includes a ready-made link to the next page. Get the exact field name from the API's documentation.</p>
+          <div class="form-field"><label>Next-Link Field (response)</label><input name="dev_pagination_next_link_response_field" placeholder="e.g. next" value="{{ config.source.dev.pagination.next_link_response_field if config and config.source.dev.pagination.next_link_response_field else 'next' }}" /></div>
+        </div>
+
+        <div class="form-grid" style="margin-top:8px;">
+          <div class="form-field">
+            <label>Max Pages (safety cap)</label>
+            <input name="dev_pagination_max_pages" type="number" min="1"
+                   value="{{ config.source.dev.pagination.max_pages if config else 500 }}" />
+            <span class="field-hint">Stops the job after this many requests no matter what, so a misbehaving API can't loop forever. Applies regardless of the strategy chosen above.</span>
+          </div>
+          <div class="form-field" style="justify-content:flex-end;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="dev_pagination_stop_when_empty"
+                       {% if not config or config.source.dev.pagination.stop_when_empty %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label>Stop as soon as a page comes back empty</label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Filters &amp; Incremental Loading <span style="font-weight:400;font-size:12px;color:#9ca3af;">(both optional)</span></div>
+
+        <div style="margin-bottom:24px;">
+          <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:6px;">Filters</div>
+          <p style="color:#6b7a90;font-size:12px;margin-bottom:12px;">
+            Restrict which records are fetched, using date/int columns detected in Step 4. Since every API names its
+            own filter query parameters differently, name the exact parameter your API expects — the operator/value
+            here are applied as <code>param=value</code>. All filters are combined with AND at runtime.
+          </p>
+          <div id="filtersList"></div>
+          <button type="button" id="addFilterBtn" style="padding:6px 12px;background:#f9fafb;color:#374151;border:1px solid #d1d5db;border-radius:6px;font-size:12px;cursor:pointer;">+ Add Filter</button>
+          <input type="hidden" name="filters_json" id="filtersJson" value="{{ config.source.dev.filters | tojson if config and config.source.dev.filters else '[]' }}" />
+        </div>
+
+        <div style="border-top:1px solid #e5e7eb;padding-top:18px;">
+          <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:6px;">High-Water Mark (incremental loading)</div>
+          <p style="color:#6b7a90;font-size:12px;margin-bottom:12px;">
+            When set, each run only fetches records newer than the last value loaded into the target table — read the
+            same way the DB-to-DB job templates do, from the target table itself (never a separate state store).
+          </p>
+          <div class="form-grid">
+            <div class="form-field">
+              <label>HWM Column</label>
+              <select name="dev_hwm_column" id="hwmColumnSelect">
+                <option value="">— none (full reload every run) —</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label>Column Data Type</label>
+              <select name="dev_hwm_column_datatype" id="hwmDatatypeSelect">
+                <option value="">(auto-detect)</option>
+                <option value="date">date</option>
+                <option value="timestamp">timestamp</option>
+                <option value="int">integer</option>
+              </select>
+            </div>
+            <div class="form-field">
+              <label>Request Param Name *</label>
+              <input name="dev_hwm_request_param" placeholder="e.g. updated_after"
+                     value="{{ config.source.dev.hwm.request_param if config and config.source.dev.hwm.request_param else '' }}" />
+              <span class="field-hint">The query param this API expects for "records after this value".</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Column Detection</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+          Fetches one sample page from the API (using the Connection/Response Format/Pagination/Filters settings
+          above) and infers a column name + data type from real records — jumps to the Columns step when done.
+        </p>
+        <button type="button" id="detectApiColsBtn"
+          style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+          &#128269; Detect Columns
+        </button>
+        <span id="apiColDetectStatus" style="font-size:12px;color:#6b7a90;margin-left:8px;"></span>
+      </div>
+
+        </div>
+      </div>
+
+      <!-- ────────────────────────── STEP 2: Basics ────────────────────────── -->
+      <div class="card form-step" data-step="1">
+        <div class="card-title">Job Basics</div>
+        <div class="form-grid">
+
+          <div class="form-field">
+            <label>DAG ID *</label>
+            <input name="dag_id" id="dagIdInput"
+                   value="{{ bare_dag_id if bare_dag_id is defined and bare_dag_id else (config.dag_id if config else '') }}"
+                   placeholder="e.g. customers" />
+            <!-- Deliberately no `required` attribute: this field lives on the
+                 Basics step, hidden (display:none) whenever another step is
+                 active. Native HTML5 constraint validation runs on the whole
+                 <form> at submit time, BEFORE the submit event (and this
+                 page's own friendly validation below) ever fires — and a
+                 browser can't focus a hidden field to show its own "required"
+                 prompt, so it just silently blocks the submit with nothing
+                 but a console warning. The submit handler below does this
+                 check instead, with a visible banner and a jump to the right
+                 step. -->
+            <span class="field-hint">Prefix added automatically: <code>hybrid_&lt;conn&gt;_</code></span>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule — pick preset</label>
+            <select id="schedulePicker">
+              <option value="">— select a preset —</option>
+              {% for lbl, cron in schedule_suggestions %}
+              <option value="{{ cron }}">{{ lbl }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="form-field">
+            <label>Schedule Interval (cron)</label>
+            <input id="scheduleInterval" name="schedule_interval"
+                   value="{{ (config.schedule_interval or '') if config else '@daily' }}"
+                   placeholder="@daily  or  0 2 * * *" />
+          </div>
+
+          <div class="form-field">
+            <label>Start Date</label>
+            <input name="start_date" type="date"
+                   value="{{ config.start_date if config else '2023-01-01' }}" />
+          </div>
+
+          <div class="form-field span-2">
+            <label>Additional Tags (comma-separated)</label>
+            <input name="extra_tags" value="{{ extra_tags_str if extra_tags_str is defined else '' }}"
+                   placeholder="e.g. finance, monthly-dump" />
+            <span class="field-hint">Your username is always included automatically.</span>
+          </div>
+
+          <div class="form-field" style="display:flex;flex-direction:column;justify-content:flex-end;padding-bottom:6px;">
+            <label>Current Tags</label>
+            <div class="tags-row">
+              {% if current_username %}<span class="tag tag-owner">{{ current_username }}</span>{% endif %}
+              {% for t in existing_tags[1:] %}<span class="tag">{{ t }}</span>{% endfor %}
+            </div>
+          </div>
+
+          <input type="hidden" name="created_by" value="{{ current_username }}" />
+          <input type="hidden" name="pipeline_type" value="hybrid" />
+        </div>
+
+        {% if active_env %}
+        <input type="hidden" name="apply_prod_same_as_dev" value="on" />
+        {% else %}
+        <div class="toggle-field" style="margin-top:14px;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="apply_prod_same_as_dev" id="sameAsDev" checked />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="sameAsDev">Use same settings for Prod as Dev</label>
+        </div>
+        {% endif %}
+      </div>
+
+      <!-- ────────────────────────── STEP 3: Columns ───────────────────────── -->
+      <div class="card form-step" data-step="2">
+        <div class="card-title">Column Setup &amp; Cleaning Rules</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:16px;">
+          Columns are auto-detected from your source. For each column you can set the data type,
+          click rule chips to choose what cleaning should happen, and optionally rename it in the refined table.
+          <br>&#128274; Your actual data values are never sent to the server during detection — only column names.
+        </p>
+
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+          <button type="button" id="reDetectBtn"
+            style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#6366f1;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+            &#8635; Auto-detect Columns
+          </button>
+          <button type="button" id="clearRulesBtn"
+            style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#f9fafb;color:#6b7280;border:1px solid #d1d5db;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+            &#10007; Clear All Rules
+          </button>
+          <span id="colDetectStatus" style="font-size:12px;color:#6b7a90;"></span>
+        </div>
+
+        <!-- Legend -->
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:10px 14px;margin-bottom:14px;font-size:11px;color:#64748b;">
+          <strong>Cleaning rules — click to toggle:</strong> &nbsp;
+          <span class="rule-pill" style="cursor:default;">Trim</span> removes leading/trailing spaces &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Strip locale tag</span> removes suffixes like <code>[rw-RW]</code> &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Strip separators</span> replaces <code>,|/-_</code> with space, keeps first word &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Title Case</span> capitalises each word &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Remove special</span> strips non-alphanumeric chars &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Null if invalid</span> sets <code>-1</code>, numeric-only, &lt;3 chars, or non-alpha-start to NULL &nbsp;|&nbsp;
+          <span class="rule-pill" style="cursor:default;">Empty→NULL</span> treats blank strings as NULL
+        </div>
+
+        <div id="colTableWrap" style="display:none;overflow-x:auto;">
+          <table class="col-table" id="colActionsTable">
+            <thead>
+              <tr>
+                <th style="width:28px;">#</th>
+                <th style="width:130px;">Column</th>
+                <th style="width:90px;">Set Type</th>
+                <th style="width:110px;">Date Format</th>
+                <th>Cleaning Rules <span style="font-weight:400;color:#9ca3af;">(click to apply)</span></th>
+                <th style="width:110px;">Rename To</th>
+                <th style="width:130px;">Sample</th>
+                <th style="width:58px;text-align:center;">Include</th>
+              </tr>
+            </thead>
+            <tbody id="colActionsBody"></tbody>
+          </table>
+        </div>
+        <p id="colEmptyNote" style="color:#9ca3af;font-size:12px;text-align:center;padding:24px 0;">
+          Click <strong>Auto-detect Columns</strong> above to load columns from your source file.
+        </p>
+
+        <!-- Serialised column actions — read by the backend -->
+        <input type="hidden" name="col_actions_json" id="colActionsJson" value="{{ col_actions_json | default('[]') }}" />
+      </div>
+
+      <!-- ────────────────────────── STEP 4: Dictionary ─────────────────────── -->
+      <div class="form-step" data-step="3">
+      <div class="card">
+        <div class="card-title">&#128218; Data Dictionary</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:14px;">
+          Describe each column in the destination table. Stored in the config JSON and surfaced on
+          the <a href="{{ url_for('catalog') }}" target="_blank">Data Catalog</a>. Optional — can be filled in later.
+        </p>
+
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">Table Description</label>
+          <div style="display:flex;gap:8px;align-items:flex-start;">
+            <textarea name="table_description" id="tableDescInput" rows="2"
+              placeholder="Briefly describe what this table contains and its business purpose…"
+              style="flex:1;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;resize:vertical;line-height:1.5;font-family:inherit;">{{ table_description_val | default('') }}</textarea>
+            <button type="button" id="suggestTableDescBtn"
+              title="Let AI write a description based on the table name and columns"
+              style="display:inline-flex;align-items:center;gap:5px;padding:7px 12px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap;">&#127775; AI Fill</button>
+          </div>
+          <span id="tableDescStatus" style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;"></span>
+        </div>
+
+        <div style="margin-bottom:18px;">
+          <label style="display:block;font-size:12px;font-weight:600;color:#374151;margin-bottom:6px;">
+            Business Date Column <span style="font-weight:400;color:#6b7a90;">(optional)</span>
+          </label>
+          <input name="business_date_column" id="businessDateColumn"
+            value="{{ config.source.dev.business_date_column if config else '' }}"
+            placeholder="e.g. report_date, invoice_date, reading_datetime"
+            style="width:100%;font-size:12px;padding:8px 10px;border:1px solid #d1d5db;border-radius:6px;font-family:inherit;" />
+          <span style="font-size:11px;color:#6b7a90;margin-top:4px;display:block;">
+            The column that says how current the data itself is — shown as
+            <strong>Business Date</strong> on the monitoring dashboard.
+          </span>
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+          <button type="button" id="addDdRow" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#10b981;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">+ Add Column</button>
+          <button type="button" id="suggestAiBtn" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#8b5cf6;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">&#127775; Suggest with AI</button>
+          <span id="aiStatus" style="font-size:12px;color:#6b7a90;"></span>
+        </div>
+
+        <table class="col-table" id="ddTable">
+          <thead>
+            <tr>
+              <th style="width:22%;">Column Name</th>
+              <th style="width:12%;">Data Type</th>
+              <th>Description</th>
+              <th style="width:16%;">Date Format</th>
+              <th style="width:38px;"></th>
+            </tr>
+          </thead>
+          <tbody id="ddBody"></tbody>
+        </table>
+      </div>
+      </div>
+
+      <!-- ────────────────────────── STEP 5: Target ────────────────────────── -->
+      <div class="card form-step" data-step="4">
+        <div class="card-title">Target &amp; Schema Configuration</div>
+
+        <!-- Transit schema info -->
+        <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:14px 16px;margin-bottom:18px;">
+          <div style="font-weight:600;color:#166534;margin-bottom:8px;">&#8505; How data moves through this pipeline</div>
+          <div style="font-size:12px;color:#166534;line-height:1.7;">
+            <strong>Raw</strong> — your file/DB data lands here first, exactly as received, and stays here permanently so it can always be reloaded later without re-uploading the source file.<br>
+            <strong>Refined</strong> — cleaned data is written here (or a direct copy if no cleaning rules), right alongside your target table below.<br>
+            <strong>Target table</strong> — data from Refined is loaded into the data warehouse here.
+          </div>
+        </div>
+
+        <div class="form-grid">
+          {% if active_env != 'prod' %}
+          <div class="sub-header">Data Warehouse Target — Dev</div>
+          <div class="form-field">
+            <label>Connection ID *</label>
+            <select name="dev_target_db_conn_id" id="devTargetConn">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.dev.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="dev_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.dev.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div></div>
+          <div class="form-field">
+            <label>Target Schema *</label>
+            <input name="dev_target_schema" id="devTargetSchema"
+                   value="{{ config.target.dev.target_schema if config else '' }}" placeholder="e.g. dw_core"
+                   oninput="updateSchemaPreview()" />
+          </div>
+          <div class="form-field">
+            <label>Target Table *</label>
+            <input name="dev_target_table" id="devTargetTable"
+                   value="{{ config.target.dev.target_table if config else '' }}" placeholder="e.g. dim_customers"
+                   oninput="updateSchemaPreview()" />
+            <span class="field-hint">The table name also determines the raw/refined transit table names.</span>
+          </div>
+          {% endif %}
+
+          <!-- Create-if-not-exists toggle -->
+          <div style="grid-column:1/-1;margin:4px 0 8px;">
+            <div class="toggle-field">
+              <label class="toggle-switch">
+                <input type="checkbox" name="create_dw_table_if_not_exists" id="createDwTable"
+                       {% if not config or config.get('create_dw_table_if_not_exists', True) %}checked{% endif %} />
+                <span class="toggle-slider"></span>
+              </label>
+              <label for="createDwTable" style="font-weight:600;font-size:12px;">
+                Create DW target table if it doesn't exist
+                <span style="font-weight:400;color:#6b7a90;font-size:11px;margin-left:6px;">
+                  — when on, the pipeline creates the table automatically on first run; when off, it will fail if the table is missing (useful as a production safety check)
+                </span>
+              </label>
+            </div>
+          </div>
+
+          {% if active_env != 'dev' %}
+          <div class="sub-header">Data Warehouse Target — Prod</div>
+          <div class="form-field">
+            <label>Connection ID *</label>
+            <select name="prod_target_db_conn_id">
+              {% for conn in connections %}
+              <option value="{{ conn }}" {% if config and config.target.prod.target_db_conn_id == conn %}selected{% endif %}>{{ conn }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div class="form-field">
+            <label>DB Type</label>
+            <select name="prod_target_db_type">
+              {% for db in ['postgresql','mysql','mssql'] %}
+              <option value="{{ db }}" {% if config and config.target.prod.db_type == db %}selected{% endif %}>{{ db }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div></div>
+          <div class="form-field">
+            <label>Target Schema *</label>
+            <input name="prod_target_schema" value="{{ config.target.prod.target_schema if config else '' }}" placeholder="e.g. dw_core" />
+          </div>
+          <div class="form-field">
+            <label>Target Table *</label>
+            <input name="prod_target_table" value="{{ config.target.prod.target_table if config else '' }}" placeholder="e.g. dim_customers" />
+          </div>
+          {% endif %}
+        </div>
+
+        <!-- Schema preview -->
+        <div id="schemaPreview" style="margin-top:16px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px 16px;font-size:11px;font-family:monospace;display:none;">
+          Transit tables will be:&nbsp;
+          <strong id="previewRawTable" style="color:#9a3412;"></strong> &rarr;
+          <strong id="previewRefinedTable" style="color:#7e22ce;"></strong>
+        </div>
+      </div>
+
+      <!-- ────────────────────────── STEP 6: Cleaning ──────────────────────── -->
+      <div class="card form-step" data-step="5">
+        <div class="card-title">&#9986; Cleaning Configuration</div>
+
+        <div class="toggle-field" style="margin-bottom:18px;">
+          <label class="toggle-switch">
+            <input type="checkbox" name="enable_cleaning" id="enableCleaning"
+                   {% if config and config.cleaning %}checked{% endif %}
+                   onchange="renderCleaningStep()" />
+            <span class="toggle-slider"></span>
+          </label>
+          <label for="enableCleaning" style="font-weight:600;">
+            Apply data cleaning before loading to the data warehouse
+            <span style="font-weight:400;color:#6b7a90;font-size:11px;margin-left:6px;">— if off, data copies raw → refined as-is</span>
+          </label>
+        </div>
+
+        <div id="cleaningOffNote" style="display:none;background:#f0f9ff;border:1px solid #bae6fd;border-radius:6px;padding:12px 16px;font-size:12px;color:#0369a1;">
+          &#128994; <strong>Pass-through mode</strong> — data will be copied from the raw table to the refined table without any changes, then loaded into the data warehouse.
+        </div>
+
+        <div id="cleaningOnPanel">
+
+          <!-- ── Cleaning script ── -->
+          <div style="margin-bottom:20px;">
+            <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:12px;">&#128196; Cleaning Script (Python)</div>
+            <p style="font-size:12px;color:#6b7a90;margin-bottom:12px;">
+              Select a Python script from the <code>cleaning_files/</code> folder. The pipeline will call the functions you tick below,
+              passing them the database engine and the raw table so they clean the right data.
+            </p>
+
+            <div style="display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap;margin-bottom:12px;">
+              <div style="flex:1;min-width:220px;">
+                <label style="font-size:11px;font-weight:600;color:#374151;display:block;margin-bottom:4px;">Script</label>
+                <select id="cleaningScriptSelect" name="cleaning_script_path"
+                        onchange="loadScriptFunctions(this.value)"
+                        style="width:100%;padding:7px 10px;border:1px solid #d1d5db;border-radius:6px;font-size:12px;">
+                  <option value="">— no script —</option>
+                  {% if config and config.cleaning and config.cleaning.script_path %}
+                  <option value="{{ config.cleaning.script_path }}" selected>{{ config.cleaning.script_path }}</option>
+                  {% endif %}
+                </select>
+              </div>
+              <div style="padding-top:20px;">
+                <span id="scriptLoadStatus" style="font-size:12px;color:#6b7a90;"></span>
+              </div>
+            </div>
+
+            <!-- Function checkboxes — populated by JS after script selected -->
+            <div id="functionList" style="display:none;">
+              <div style="font-size:11px;font-weight:600;color:#374151;margin-bottom:8px;">Functions to call (tick to include):</div>
+              <div id="functionCheckboxes" style="display:flex;flex-direction:column;gap:8px;"></div>
+            </div>
+            <div id="functionEmptyNote" style="font-size:12px;color:#9ca3af;display:none;">No callable functions found in this script.</div>
+          </div>
+
+          <!-- ── Auto-generated SQL from column rule chips ── -->
+          <div style="border-top:1px solid #e5e7eb;padding-top:16px;margin-bottom:20px;">
+            <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:8px;">
+              &#128196; Auto-generated SQL <span style="font-weight:400;color:#9ca3af;font-size:11px;">(from column rule chips in Step 3)</span>
+              <span id="autoSqlCount" style="font-weight:400;color:#9ca3af;font-size:11px;margin-left:4px;"></span>
+            </div>
+            <div id="autoSqlPreview" class="sql-preview">No column rules selected yet — go to Step 3 to add cleaning rules.</div>
+          </div>
+
+          <!-- ── Manual SQL ── -->
+          <div style="border-top:1px solid #e5e7eb;padding-top:16px;">
+            <div style="font-size:13px;font-weight:700;color:#111827;margin-bottom:4px;">Additional SQL rules <span style="font-weight:400;font-size:11px;color:#9ca3af;">(optional)</span></div>
+            <p style="font-size:11px;color:#9ca3af;margin-bottom:10px;">Extra SQL UPDATE statements to run on the raw table before the copy to refined.</p>
+            <div id="manualSqlList">
+              {% for sql in existing_sql_queries %}
+              <div class="manual-sql-row">
+                <textarea name="manual_sql_query[]" placeholder="UPDATE pipeline.schema_table_refined SET col = ...">{{ sql }}</textarea>
+                <button type="button" onclick="this.parentElement.remove();">&#10005;</button>
+              </div>
+              {% endfor %}
+            </div>
+            <button type="button" onclick="addManualSqlRow()"
+              style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;background:#10b981;color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;">
+              + Add SQL Rule
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ────────────────────────── STEP 7: Review ────────────────────────── -->
+      <div class="card form-step" data-step="6">
+        <div class="card-title">Review &amp; Save</div>
+        <p style="color:#6b7a90;font-size:12px;margin-bottom:16px;">Check your settings below, then click <strong>Save</strong> to create the pipeline.</p>
+        <div id="reviewSummary" style="font-size:12px;line-height:2;color:#444;"></div>
+      </div>
+
+      <!-- Action Bar -->
+      <div class="form-actions">
+        <button class="btn btn-secondary" type="button" id="prevBtn">&#8592; Back</button>
+        <button class="btn btn-primary"   type="button" id="nextBtn">Next &#8594;</button>
+        <button class="btn btn-primary"   type="submit"  id="saveBtn">&#10003; Save</button>
+        <a      class="btn btn-secondary" href="{{ url_for('hybrid_jobs') }}">&#10005; Cancel</a>
+      </div>
+    </form>
+  </main>
+
+  <div class="footer">{{ project_name }}</div>
+</div>
+
+<script>
+// ── Constants ──────────────────────────────────────────────────────────────────
+
+const DTYPE_OPTIONS = ['text','integer','decimal','boolean','timestamp','date'];
+
+const DATE_FORMATS = [
+  { label: 'Select format…',                                value: '' },
+  { label: '%Y-%m-%d          (2024-01-31)',                value: '%Y-%m-%d' },
+  { label: '%d/%m/%Y          (31/01/2024)',                value: '%d/%m/%Y' },
+  { label: '%m/%d/%Y          (01/31/2024)',                value: '%m/%d/%Y' },
+  { label: '%d-%m-%Y          (31-01-2024)',                value: '%d-%m-%Y' },
+  { label: '%Y%m%d            (20240131)',                  value: '%Y%m%d' },
+  { label: '%Y-%m-%d %H:%M:%S (2024-01-31 14:30:00)',      value: '%Y-%m-%d %H:%M:%S' },
+  { label: '%Y-%m-%dT%H:%M:%S (ISO 8601)',                 value: '%Y-%m-%dT%H:%M:%S' },
+  { label: '%Y-%m-%d %H:%M:%S.%f (with microseconds)',     value: '%Y-%m-%d %H:%M:%S.%f' },
+  { label: '%d/%m/%Y %H:%M:%S (31/01/2024 14:30:00)',      value: '%d/%m/%Y %H:%M:%S' },
+  { label: '%d/%m/%Y %H:%M   (31/01/2024 14:30)',          value: '%d/%m/%Y %H:%M' },
+  { label: '%Y/%m/%d          (2024/01/31)',                value: '%Y/%m/%d' },
+  { label: 'Custom…',                                      value: '__custom__' },
+];
+
+function _fmtWidget(i, currentVal) {
+  const _knownVals = DATE_FORMATS.map(f => f.value).filter(v => v && v !== '__custom__');
+  const _isCustom  = currentVal && !_knownVals.includes(currentVal);
+  const _selectVal = _isCustom ? '__custom__' : (currentVal || '');
+  const opts = DATE_FORMATS.map(f =>
+    `<option value="${f.value}"${_selectVal === f.value ? ' selected' : ''}>${f.label}</option>`
+  ).join('');
+  const customInp = _isCustom
+    ? `<input type="text" class="col-fmt-inp" data-row="${i}" value="${currentVal}"
+         placeholder="e.g. %d/%m/%Y" title="Python strptime format"
+         style="width:100%;font-size:11px;margin-top:3px;"
+         oninput="onFormatChange(${i},this.value)" />`
+    : '';
+  return `<select class="col-fmt-sel" data-row="${i}"
+            onchange="onFormatSelectChange(${i},this.value)"
+            style="width:100%;font-size:11px;">${opts}</select>${customInp}`;
+}
+const RULES = [
+  { id:'trim',             label:'Trim spaces' },
+  { id:'strip_suffix',     label:'Strip locale tag' },
+  { id:'strip_separators', label:'Strip separators' },
+  { id:'titlecase',        label:'Title Case' },
+  { id:'upper',            label:'UPPER' },
+  { id:'lower',            label:'lower' },
+  { id:'remove_special',   label:'Remove special chars' },
+  { id:'null_invalid',     label:'Null if invalid' },
+  { id:'null_empty',       label:'Empty→NULL' },
+];
+
+// ── Step navigation ───────────────────────────────────────────────────────────
+
+const steps  = Array.from(document.querySelectorAll('.form-step'));
+const tabs   = Array.from(document.querySelectorAll('.step-tab'));
+const nextBtn = document.getElementById('nextBtn');
+const prevBtn = document.getElementById('prevBtn');
+const saveBtn = document.getElementById('saveBtn');
+let current = 0;
+
+function renderStep() {
+  steps.forEach((s, i) => s.style.display = i === current ? 'block' : 'none');
+  tabs.forEach((t, i)  => t.classList.toggle('active', i === current));
+  prevBtn.style.display = current === 0             ? 'none'        : 'inline-flex';
+  nextBtn.style.display = current === steps.length - 1 ? 'none'    : 'inline-flex';
+  saveBtn.style.display = current === steps.length - 1 ? 'inline-flex' : 'none';
+  if (typeof refreshHwmColumnOptions === 'function') refreshHwmColumnOptions();
+  if (current === 3 && typeof syncDdFromColumns === 'function') syncDdFromColumns();
+  if (current === 5) renderCleaningStep();
+  if (current === steps.length - 1) buildReview();
+}
+
+tabs.forEach(t => t.addEventListener('click', () => { current = parseInt(t.dataset.idx); renderStep(); }));
+nextBtn.addEventListener('click', () => { if (current < steps.length - 1) { current++; renderStep(); } });
+prevBtn.addEventListener('click', () => { if (current > 0) { current--; renderStep(); } });
+
+// ── Source type toggle ─────────────────────────────────────────────────────────
+
+function setSourceType(type) {
+  document.getElementById('sourceTypeInput').value = type;
+  document.getElementById('fileFields').style.display = type === 'file' ? '' : 'none';
+  document.getElementById('dbFields').style.display   = type === 'db'   ? '' : 'none';
+  document.getElementById('apiFields').style.display  = type === 'api'  ? '' : 'none';
+  document.getElementById('srcTypeFile').classList.toggle('active', type === 'file');
+  document.getElementById('srcTypeDb').classList.toggle('active', type === 'db');
+  document.getElementById('srcTypeApi').classList.toggle('active', type === 'api');
+}
+
+// Apply on load
+(function() {
+  const t = document.getElementById('sourceTypeInput').value || 'file';
+  setSourceType(t);
+})();
+
+// ── URL mode toggle (API source: Base URL + Auth vs. one pasted-and-encrypted URL) ──
+
+function setUrlMode(mode) {
+  document.getElementById('urlModeInput').value = mode;
+  document.getElementById('urlModeSeparateFields').style.display = mode === 'full' ? 'none' : '';
+  document.getElementById('urlModeFullFields').style.display     = mode === 'full' ? '' : 'none';
+  document.getElementById('authSection').style.display           = mode === 'full' ? 'none' : '';
+  document.getElementById('urlModeSeparate').classList.toggle('active', mode !== 'full');
+  document.getElementById('urlModeFull').classList.toggle('active', mode === 'full');
+}
+
+(function() {
+  const m = document.getElementById('urlModeInput').value || 'separate';
+  setUrlMode(m);
+})();
+
+// ── Schedule picker ────────────────────────────────────────────────────────────
+
+document.getElementById('schedulePicker').addEventListener('change', function() {
+  if (this.value) document.getElementById('scheduleInterval').value = this.value;
+});
+
+// ── Schema preview ─────────────────────────────────────────────────────────────
+
+function updateSchemaPreview() {
+  const tbl     = (document.getElementById('devTargetTable')  || {}).value || '';
+  const schema  = (document.getElementById('devTargetSchema') || {}).value || '';
+  const preview = document.getElementById('schemaPreview');
+  if (tbl && schema) {
+    document.getElementById('previewRawTable').textContent     = 'raw.' + schema + '_' + tbl + '_raw';
+    document.getElementById('previewRefinedTable').textContent = 'pipeline.' + schema + '_' + tbl + '_refined';
+    preview.style.display = '';
+  } else {
+    preview.style.display = 'none';
+  }
+}
+
+// ── File browser dropdown ──────────────────────────────────────────────────────
+
+let _files = [];
+
+(function loadFiles() {
+  fetch('/api/files')
+    .then(r => r.ok ? r.json() : Promise.reject())
+    .then(d => { _files = d.files || []; })
+    .catch(() => {});
+})();
+
+(function initFileDropdown() {
+  const inp = document.getElementById('sampleFileInput');
+  const dd  = document.getElementById('fileDropdown');
+  if (!inp || !dd) return;
+
+  function show(items) {
+    dd.innerHTML = '';
+    if (!items.length) { dd.style.display = 'none'; return; }
+    items.forEach(f => {
+      const row = document.createElement('div');
+      row.textContent = f;
+      row.style.cssText = 'padding:7px 11px;cursor:pointer;font-size:13px;border-bottom:1px solid #e0f2fe;';
+      row.addEventListener('mouseenter', () => row.style.background = '#e0f2fe');
+      row.addEventListener('mouseleave', () => row.style.background = '');
+      row.addEventListener('mousedown', e => {
+        e.preventDefault();
+        inp.value = f;
+        dd.style.display = 'none';
+        autoFillFromFilename(f);
+      });
+      dd.appendChild(row);
+    });
+    dd.style.display = 'block';
+  }
+
+  inp.addEventListener('input', () => {
+    const q = inp.value.trim().toLowerCase();
+    show(q ? _files.filter(f => f.toLowerCase().includes(q)) : []);
+  });
+  inp.addEventListener('focus', () => {
+    const q = inp.value.trim().toLowerCase();
+    if (q) show(_files.filter(f => f.toLowerCase().includes(q)));
+  });
+  inp.addEventListener('blur', () => setTimeout(() => { dd.style.display = 'none'; }, 150));
+})();
+
+function autoFillFromFilename(filename) {
+  const ext  = (filename.match(/\.([^.]+)$/) || [])[1] || 'csv';
+  const fmt  = ext.toLowerCase() === 'parquet' ? 'parquet' : 'csv';
+  const bare = filename.replace(/\.[^.]+$/, '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+
+  const dagEl = document.getElementById('dagIdInput');
+  if (dagEl && !dagEl.value) dagEl.value = bare;
+
+  const fnEl = document.getElementById('devFileName');
+  if (fnEl) fnEl.value = filename;
+
+  const tblEl = document.getElementById('devTargetTable');
+  if (tblEl && !tblEl.value) { tblEl.value = bare; updateSchemaPreview(); }
+
+  const fmtEl = document.getElementById('devFileFormat');
+  if (fmtEl) fmtEl.value = fmt;
+}
+
+// ── Column detection ───────────────────────────────────────────────────────────
+
+function gatherFileParams() {
+  const filename  = (document.getElementById('sampleFileInput') || {}).value || '';
+  const fmtEl     = document.getElementById('devFileFormat');
+  const delimEl   = document.querySelector('[name=dev_delimiter]');
+  const headerEl  = document.querySelector('[name=dev_has_header]');
+  const skipEl    = document.querySelector('[name=dev_skip_rows]');
+  const nullEl    = document.querySelector('[name=dev_null_values]');
+  return {
+    server_filename: filename,
+    file_format:     fmtEl    ? fmtEl.value    : 'csv',
+    delimiter:       delimEl  ? delimEl.value  : ',',
+    has_header:      headerEl ? (headerEl.checked ? 'true' : 'false') : 'true',
+    skip_rows:       skipEl   ? skipEl.value   : '0',
+    null_values:     nullEl   ? nullEl.value   : 'NULL,null,None,NA',
+  };
+}
+
+function detectColumns(statusEl) {
+  const params = gatherFileParams();
+  if (!params.server_filename) {
+    statusEl.textContent = 'Enter a filename first.';
+    statusEl.style.color = '#dc2626';
+    return;
+  }
+  statusEl.textContent = '&#128269; Detecting…';
+  statusEl.style.color = '#6b7a90';
+
+  const fd = new FormData();
+  Object.entries(params).forEach(([k, v]) => fd.append(k, v));
+
+  fetch('/api/preview-columns', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(data => {
+      if (data.error) { statusEl.textContent = '&#9888; ' + data.error; statusEl.style.color='#dc2626'; return; }
+      renderColumnTable(data.columns || []);
+      statusEl.textContent = '&#10003; ' + (data.columns||[]).length + ' column(s) detected.';
+      statusEl.style.color = '#16a34a';
+      // Auto-progress to columns step
+      current = 2; renderStep();
+    })
+    .catch(e => { statusEl.textContent = '&#9888; Error: ' + e; statusEl.style.color='#dc2626'; });
+}
+
+document.getElementById('detectColsBtn').addEventListener('click',  () => detectColumns(document.getElementById('detectStatus')));
+document.getElementById('reDetectBtn').addEventListener('click',    () => detectColumns(document.getElementById('colDetectStatus')));
+
+// DB source detect
+document.getElementById('detectDbColsBtn').addEventListener('click', function() {
+  const st   = document.getElementById('detectDbStatus');
+  const conn = (document.querySelector('[name=dev_source_db_conn_id]') || {}).value || '';
+  const sql  = (document.querySelector('[name=dev_sql_text]') || {}).value || '';
+  if (!conn || !sql) { st.textContent = 'Select a connection and enter SQL first.'; st.style.color='#dc2626'; return; }
+  st.textContent = 'Detecting…'; st.style.color='#6b7a90';
+  fetch('/api/columns-from-query', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({conn_id: conn, sql}),
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.error) { st.textContent = '&#9888; ' + data.error; st.style.color='#dc2626'; return; }
+    const cols = (data.columns||[]).map(c => ({original:c.name, clean:c.name, dtype:'text', sample:[]}));
+    renderColumnTable(cols);
+    st.textContent = '&#10003; ' + cols.length + ' column(s) detected.';
+    st.style.color = '#16a34a';
+    current = 2; renderStep();
+  })
+  .catch(e => { st.textContent = '&#9888; ' + e; st.style.color='#dc2626'; });
+});
+
+// ── Column actions table ───────────────────────────────────────────────────────
+
+// In-memory model for column state
+let _colData = [];
+
+function loadColActionsFromJson() {
+  try {
+    const raw = document.getElementById('colActionsJson').value || '[]';
+    _colData = JSON.parse(raw);
+  } catch(e) { _colData = []; }
+}
+
+function saveColActionsToJson() {
+  document.getElementById('colActionsJson').value = JSON.stringify(_colData);
+  updateAutoSql();
+}
+
+function renderColumnTable(columns) {
+  // Merge detected columns with any saved state
+  const existing = {};
+  _colData.forEach(ca => { existing[ca.name] = ca; });
+
+  _colData = columns.map((col, i) => {
+    const saved = existing[col.clean] || {};
+    return {
+      name:     col.clean,
+      original: col.original,
+      type:     saved.type    || col.dtype || 'text',
+      format:   saved.format  || '',
+      rules:    saved.rules   || [],
+      rename:   saved.rename  || '',
+      exclude:  saved.exclude || false,
+      sample:   col.sample    || [],
+      _idx:     i,
+    };
+  });
+
+  _rebuildTable();
+  document.getElementById('colTableWrap').style.display = '';
+  document.getElementById('colEmptyNote').style.display = 'none';
+  saveColActionsToJson();
+}
+
+function _rebuildTable() {
+  const tbody = document.getElementById('colActionsBody');
+  tbody.innerHTML = '';
+  _colData.forEach((ca, i) => {
+    const typeOpts = DTYPE_OPTIONS.map(dt =>
+      `<option value="${dt}" ${dt === ca.type ? 'selected':''}>${dt}</option>`
+    ).join('');
+    const pills = RULES.map(r =>
+      `<span class="rule-pill ${ca.rules.includes(r.id) ? 'active':''}" data-row="${i}" data-rule="${r.id}">${r.label}</span>`
+    ).join('');
+    const sample = (ca.sample || []).slice(0,2).join(', ');
+    const excCls  = ca.exclude ? ' col-excluded' : '';
+    const isDate  = ['date','timestamp','datetime'].includes(ca.type);
+    const fmtCell = isDate
+      ? _fmtWidget(i, ca.format || '')
+      : `<span style="color:#d1d5db;font-size:11px;">—</span>`;
+    tbody.innerHTML += `
+      <tr id="crow-${i}" class="${excCls}">
+        <td style="color:#9ca3af;font-size:11px;">${i+1}</td>
+        <td>
+          <code style="font-size:11px;">${ca.name}</code>
+          ${ca.original !== ca.name ? `<div style="font-size:10px;color:#9ca3af;">${ca.original}</div>` : ''}
+        </td>
+        <td>
+          <select data-row="${i}" class="col-type-sel" onchange="onTypeChange(${i},this.value)">${typeOpts}</select>
+        </td>
+        <td id="fmt-cell-${i}">${fmtCell}</td>
+        <td><div class="rule-pills">${pills}</div></td>
+        <td><input type="text" class="col-rename-inp" data-row="${i}" value="${ca.rename||''}" placeholder="keep original" oninput="onRenameChange(${i},this.value)" /></td>
+        <td class="col-sample" title="${(ca.sample||[]).join(', ')}">${sample || '—'}</td>
+        <td style="text-align:center;">
+          <label class="toggle-switch exclude-toggle" style="transform:scale(.8);">
+            <input type="checkbox" ${ca.exclude ? '' : 'checked'} data-row="${i}" class="col-include-chk" onchange="onIncludeChange(${i},this.checked)" />
+            <span class="toggle-slider"></span>
+          </label>
+        </td>
+      </tr>`;
+  });
+
+  // Wire pill clicks
+  tbody.querySelectorAll('.rule-pill').forEach(pill => {
+    pill.addEventListener('click', function() {
+      const i    = parseInt(this.dataset.row);
+      const rule = this.dataset.rule;
+      const rules = _colData[i].rules;
+      const idx  = rules.indexOf(rule);
+      if (idx >= 0) rules.splice(idx, 1); else rules.push(rule);
+      this.classList.toggle('active', idx < 0);
+      saveColActionsToJson();
+    });
+  });
+}
+
+function onTypeChange(i, val) {
+  _colData[i].type = val;
+  if (!['date','timestamp','datetime'].includes(val)) _colData[i].format = '';
+  // Re-render just the format cell instead of full table rebuild
+  const cell   = document.getElementById('fmt-cell-' + i);
+  const isDate = ['date','timestamp','datetime'].includes(val);
+  cell.innerHTML = isDate
+    ? _fmtWidget(i, _colData[i].format || '')
+    : `<span style="color:#d1d5db;font-size:11px;">—</span>`;
+  saveColActionsToJson();
+}
+function onFormatChange(i, val)  { _colData[i].format = val; saveColActionsToJson(); }
+function onFormatSelectChange(i, val) {
+  const cell = document.getElementById('fmt-cell-' + i);
+  let customInp = cell.querySelector('.col-fmt-inp');
+  if (val === '__custom__') {
+    if (!customInp) {
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.className = 'col-fmt-inp'; inp.dataset.row = i;
+      inp.placeholder = 'e.g. %d/%m/%Y'; inp.title = 'Python strptime format';
+      inp.style.cssText = 'width:100%;font-size:11px;margin-top:3px;';
+      inp.oninput = function() { onFormatChange(i, this.value); };
+      cell.appendChild(inp);
+      inp.focus();
+    }
+  } else {
+    if (customInp) customInp.remove();
+    _colData[i].format = val;
+    saveColActionsToJson();
+  }
+}
+function onRenameChange(i, val)  { _colData[i].rename = val; saveColActionsToJson(); }
+function onIncludeChange(i, chk) {
+  _colData[i].exclude = !chk;
+  const row = document.getElementById('crow-' + i);
+  if (row) row.classList.toggle('col-excluded', !chk);
+  saveColActionsToJson();
+}
+
+document.getElementById('clearRulesBtn').addEventListener('click', function() {
+  _colData.forEach(ca => { ca.rules = []; });
+  _rebuildTable();
+  saveColActionsToJson();
+});
+
+// Restore from saved JSON on page load
+(function() {
+  loadColActionsFromJson();
+  if (_colData.length) {
+    _rebuildTable();
+    document.getElementById('colTableWrap').style.display = '';
+    document.getElementById('colEmptyNote').style.display = 'none';
+  }
+})();
+
+// ── API source fields (Connection / Response Format / Pagination / Filters & HWM) ──
+
+function initKvRepeater(listId, hiddenId, addBtnId, placeholderKey, placeholderVal) {
+  const list   = document.getElementById(listId);
+  const hidden = document.getElementById(hiddenId);
+
+  function serialize() {
+    const obj = {};
+    list.querySelectorAll('.kv-row').forEach(row => {
+      const k = row.querySelector('.kv-key').value.trim();
+      const v = row.querySelector('.kv-val').value;
+      if (k) obj[k] = v;
+    });
+    hidden.value = JSON.stringify(obj);
+  }
+
+  function addRow(k, v) {
+    const row = document.createElement('div');
+    row.className = 'kv-row';
+    row.innerHTML = `
+      <input class="kv-key" placeholder="${placeholderKey}" value="${(k||'').replace(/"/g,'&quot;')}" />
+      <input class="kv-val" placeholder="${placeholderVal}" value="${(v||'').replace(/"/g,'&quot;')}" />
+      <button type="button">&#10005;</button>`;
+    row.querySelectorAll('input').forEach(inp => inp.addEventListener('input', serialize));
+    row.querySelector('button').addEventListener('click', () => { row.remove(); serialize(); });
+    list.appendChild(row);
+  }
+
+  document.getElementById(addBtnId).addEventListener('click', () => addRow('', ''));
+
+  try {
+    const existing = JSON.parse(hidden.value || '{}');
+    Object.entries(existing).forEach(([k, v]) => addRow(k, v));
+  } catch (e) { /* ignore malformed existing JSON */ }
+
+  return { addRow, serialize };
+}
+
+initKvRepeater('paramsList',  'requestParamsJson',  'addParamBtn',  'param name', 'value');
+initKvRepeater('headersList', 'requestHeadersJson', 'addHeaderBtn', 'header name', 'value');
+
+function syncAuthPanel() {
+  const val = document.getElementById('authTypeSelect').value;
+  document.getElementById('authPanelApiKey').classList.toggle('active', val === 'api_key_header');
+  document.getElementById('authPanelApiKeyParam').classList.toggle('active', val === 'api_key_query_param');
+  document.getElementById('authPanelLoginToken').classList.toggle('active', val === 'login_token');
+}
+document.getElementById('authTypeSelect').addEventListener('change', syncAuthPanel);
+syncAuthPanel();
+
+function syncPagPanel() {
+  const val = document.getElementById('paginationStrategy').value;
+  document.getElementById('pagPanelOffsetLimit').classList.toggle('active', val === 'offset_limit');
+  document.getElementById('pagPanelPageNumber').classList.toggle('active', val === 'page_number');
+  document.getElementById('pagPanelCursor').classList.toggle('active', val === 'cursor');
+  document.getElementById('pagPanelNextLink').classList.toggle('active', val === 'next_link');
+  const help = {
+    none:         "Use this if a single request already returns every record you need.",
+    offset_limit: "Most common. Pick this if your API's docs mention parameters like \u201coffset\u201d/\u201climit\u201d, \u201cskip\u201d/\u201ctake\u201d, or \u201cstart\u201d/\u201ccount\u201d.",
+    page_number:  "Pick this if your API's docs mention a \u201cpage number\u201d or \u201cpage index\u201d parameter.",
+    cursor:       "Only use this if your API's docs explicitly describe a cursor or continuation token — ask a developer if unsure.",
+    next_link:    "Only use this if your API's response itself contains a ready-to-use link to the next page — ask a developer if unsure.",
+  };
+  document.getElementById('pagStrategyHelp').textContent = help[val] || '';
+}
+document.getElementById('paginationStrategy').addEventListener('change', syncPagPanel);
+syncPagPanel();
+
+// Quick-fill chips: click a common parameter-name pair instead of typing it,
+// for the two strategies whose param names vary by API vendor.
+const PAG_CHIP_PRESETS = {
+  offset_limit: [
+    { offset: 'offset', limit: 'limit' },
+    { offset: 'skip', limit: 'take' },
+    { offset: 'start', limit: 'count' },
+  ],
+  page_number: [
+    { page: 'page', page_size: 'page_size' },
+    { page: 'page', page_size: 'per_page' },
+    { page: 'pageNumber', page_size: 'pageSize' },
+  ],
+};
+document.querySelectorAll('.pag-chip-row').forEach(row => {
+  const presets = PAG_CHIP_PRESETS[row.dataset.chipPanel] || [];
+  const panel = row.closest('.pag-panel');
+  presets.forEach(pair => {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'pag-chip';
+    chip.textContent = Object.values(pair).join(' / ');
+    chip.addEventListener('click', () => {
+      Object.entries(pair).forEach(([field, name]) => {
+        const input = panel.querySelector(`[data-chip-field="${field}"]`);
+        if (input) input.value = name;
+      });
+    });
+    row.appendChild(chip);
+  });
+});
+
+// Two page-size inputs (offset_limit / page_number) share one config value —
+// keep them in sync so whichever panel is visible reflects the real value.
+document.querySelectorAll('.pag-page-size').forEach(el => {
+  el.addEventListener('input', function() {
+    document.querySelectorAll('.pag-page-size').forEach(other => { if (other !== this) other.value = this.value; });
+  });
+});
+
+function syncRecordsPathField() {
+  const val = document.getElementById('responseFormatType').value;
+  document.getElementById('recordsPathField').style.display = val === 'json_object_path' ? '' : 'none';
+}
+document.getElementById('responseFormatType').addEventListener('change', syncRecordsPathField);
+syncRecordsPathField();
+
+function gatherConnectionConfig() {
+  const authType = document.getElementById('authTypeSelect').value;
+  const auth = { type: authType };
+  if (authType === 'api_key_header') {
+    auth.header_name = (document.querySelector('[name=dev_auth_header_name]')||{}).value || '';
+    auth.api_key     = (document.querySelector('[name=dev_auth_api_key]')||{}).value || '';
+  } else if (authType === 'api_key_query_param') {
+    auth.param_name  = (document.querySelector('[name=dev_auth_param_name]')||{}).value || '';
+    auth.api_key     = (document.querySelector('[name=dev_auth_api_key_param]')||{}).value || '';
+  } else if (authType === 'login_token') {
+    auth.token_endpoint          = (document.querySelector('[name=dev_auth_token_endpoint]')||{}).value || '';
+    auth.token_username_field    = (document.querySelector('[name=dev_auth_token_username_field]')||{}).value || '';
+    auth.token_username          = (document.querySelector('[name=dev_auth_token_username]')||{}).value || '';
+    auth.token_password_field    = (document.querySelector('[name=dev_auth_token_password_field]')||{}).value || '';
+    auth.token_password          = (document.querySelector('[name=dev_auth_token_password]')||{}).value || '';
+    auth.token_request_body_type = (document.querySelector('[name=dev_auth_token_request_body_type]')||{}).value || 'json';
+    auth.token_response_field    = (document.querySelector('[name=dev_auth_token_response_field]')||{}).value || '';
+    auth.token_header_name       = (document.querySelector('[name=dev_auth_token_header_name]')||{}).value || '';
+    auth.token_header_prefix     = (document.querySelector('[name=dev_auth_token_header_prefix]')||{}).value;
+  }
+  let params = {}, headers = {};
+  try { params  = JSON.parse(document.getElementById('requestParamsJson').value  || '{}'); } catch(e) {}
+  try { headers = JSON.parse(document.getElementById('requestHeadersJson').value || '{}'); } catch(e) {}
+  return {
+    dag_id: {{ (config.dag_id if config else '') | tojson }},
+    env: 'dev',
+    url_mode:        document.getElementById('urlModeInput').value || 'separate',
+    full_url:        (document.getElementById('fullUrlInput')||{}).value || '',
+    base_url:        document.getElementById('baseUrlInput').value.trim(),
+    data_endpoint:   '',
+    http_method:     document.getElementById('httpMethodInput').value,
+    timeout_seconds: parseInt((document.querySelector('[name=dev_timeout_seconds]')||{}).value || '30', 10),
+    request_params:  params,
+    request_headers: headers,
+    auth: auth,
+  };
+}
+
+document.getElementById('testConnBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('testConnStatus');
+  const resultEl = document.getElementById('testConnResult');
+  const summaryEl = document.getElementById('testConnSummary');
+  const sampleEl = document.getElementById('testConnSample');
+  const cfg = gatherConnectionConfig();
+  const hasUrl = cfg.url_mode === 'full' ? !!cfg.full_url.trim() : !!cfg.base_url;
+  if (!hasUrl) {
+    statusEl.textContent = cfg.url_mode === 'full' ? 'Paste the full request URL first.' : 'Enter a Base URL first.';
+    statusEl.style.color = '#dc2626'; return;
+  }
+
+  statusEl.textContent = '⏳ Testing…'; statusEl.style.color = '#6b7a90';
+  resultEl.style.display = 'none';
+
+  try {
+    const resp = await fetch('/api/api-test-connection', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg),
+    });
+    const data = await resp.json();
+    statusEl.textContent = '';
+    resultEl.className = 'test-result ' + (data.status === 'ok' ? 'ok' : 'error');
+    resultEl.style.display = 'block';
+
+    if (data.status === 'ok') {
+      summaryEl.innerHTML = '&#9989; HTTP ' + data.http_status + ' — detected format: <strong>' +
+        data.detected_format + '</strong>' +
+        (data.detected_records_path ? ' (records path: <code>' + data.detected_records_path + '</code>)' : '') +
+        ' — ' + data.record_count_sample + ' sample record(s).';
+      // Pre-fill Response Format step with the detection result, unless the
+      // user already picked something different from the default.
+      const fmtSel = document.getElementById('responseFormatType');
+      if (fmtSel.value === 'json_array' || !fmtSel.dataset.touched) {
+        fmtSel.value = data.detected_format;
+        syncRecordsPathField();
+        if (data.detected_records_path) {
+          const rp = document.querySelector('[name=dev_response_format_records_path]');
+          if (rp) rp.value = data.detected_records_path;
+        }
+      }
+      sampleEl.textContent = data.sample_raw || '';
+      sampleEl.style.display = data.sample_raw ? 'block' : 'none';
+    } else {
+      summaryEl.innerHTML = '&#10060; ' + (data.error || 'Connection failed.');
+      sampleEl.style.display = 'none';
+    }
+  } catch (e) {
+    statusEl.textContent = ''; resultEl.className = 'test-result error'; resultEl.style.display = 'block';
+    summaryEl.textContent = '✗ ' + e.message;
+  }
+});
+document.getElementById('responseFormatType').addEventListener('change', function() { this.dataset.touched = '1'; });
+
+document.getElementById('suggestFormatBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('suggestFormatStatus');
+  const sample = (document.getElementById('testConnSample')||{}).textContent || '';
+  if (!sample.trim()) {
+    statusEl.style.color = '#b45309';
+    statusEl.textContent = '⚠ Run Test Connection above first, so AI has a sample response to look at.';
+    return;
+  }
+  statusEl.style.color = '#6b7a90'; statusEl.textContent = '⏳ Asking AI…';
+  try {
+    const resp = await fetch('/api/suggest-descriptions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({sample_response: sample}),
+    });
+    const data = await resp.json();
+    if (data.error) { statusEl.style.color = '#b91c1c'; statusEl.textContent = '✗ ' + data.error; return; }
+    if (data.response_format) {
+      const fmtSel = document.getElementById('responseFormatType');
+      fmtSel.value = data.response_format.type;
+      fmtSel.dataset.touched = '1';
+      syncRecordsPathField();
+      const rp = document.querySelector('[name=dev_response_format_records_path]');
+      if (rp) rp.value = data.response_format.records_path || '';
+      statusEl.style.color = '#15803d'; statusEl.textContent = '✓ Format suggested: ' + data.response_format.type;
+    } else {
+      statusEl.style.color = '#b45309'; statusEl.textContent = '⚠ No suggestion returned';
+    }
+  } catch (e) { statusEl.style.color = '#b91c1c'; statusEl.textContent = '✗ ' + e.message; }
+});
+
+function gatherFiltersForDetection() {
+  try { return JSON.parse(document.getElementById('filtersJson').value || '[]'); } catch (e) { return []; }
+}
+
+document.getElementById('detectApiColsBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('apiColDetectStatus');
+  const cfg = gatherConnectionConfig();
+  const hasUrl = cfg.url_mode === 'full' ? !!cfg.full_url.trim() : !!cfg.base_url;
+  if (!hasUrl) {
+    statusEl.textContent = cfg.url_mode === 'full' ? 'Paste the full request URL above first.' : 'Enter a Base URL above first.';
+    statusEl.style.color = '#dc2626'; return;
+  }
+  cfg.response_format = {
+    type: document.getElementById('responseFormatType').value,
+    records_path: (document.querySelector('[name=dev_response_format_records_path]')||{}).value || '',
+  };
+  cfg.filters = gatherFiltersForDetection();
+  // Pagination — so column detection can sample a 2nd page too, not just the
+  // first. Without this, a column that happens to be entirely absent/null on
+  // page 1 (common with large field sets — not every reading has every
+  // metric) would silently never show up in the detected column list.
+  cfg.pagination = {
+    strategy:                 (document.getElementById('paginationStrategy')||{}).value || 'none',
+    page_size:                parseInt((document.querySelector('[name=dev_pagination_page_size]')||{}).value || '100', 10),
+    offset_param:             (document.querySelector('[name=dev_pagination_offset_param]')||{}).value || 'offset',
+    limit_param:              (document.querySelector('[name=dev_pagination_limit_param]')||{}).value || 'limit',
+    page_param:               (document.querySelector('[name=dev_pagination_page_param]')||{}).value || 'page',
+    page_size_param:          (document.querySelector('[name=dev_pagination_page_size_param]')||{}).value || 'page_size',
+    start_page:               parseInt((document.querySelector('[name=dev_pagination_start_page]')||{}).value || '1', 10),
+    cursor_param:             (document.querySelector('[name=dev_pagination_cursor_param]')||{}).value || 'cursor',
+    cursor_response_field:    (document.querySelector('[name=dev_pagination_cursor_response_field]')||{}).value || '',
+    next_link_response_field: (document.querySelector('[name=dev_pagination_next_link_response_field]')||{}).value || 'next',
+  };
+
+  statusEl.textContent = '⏳ Fetching sample…'; statusEl.style.color = '#6b7a90';
+  try {
+    const resp = await fetch('/api/api-detect-columns', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(cfg),
+    });
+    const data = await resp.json();
+    if (data.error && (!data.columns || !data.columns.length)) {
+      statusEl.textContent = '⚠ ' + data.error; statusEl.style.color = '#dc2626'; return;
+    }
+    renderColumnTable(data.columns || []);
+    statusEl.textContent = '✓ ' + (data.columns||[]).length + ' column(s) detected from ' + (data.records_fetched||0) + ' sample record(s).';
+    statusEl.style.color = '#16a34a';
+    current = 2; renderStep();
+  } catch (e) {
+    statusEl.textContent = '⚠ Error: ' + e.message; statusEl.style.color = '#dc2626';
+  }
+});
+
+const OPERATORS = ['>', '>=', '<', '<=', '=', '!='];
+
+function eligibleFilterColumns() {
+  return _colData.filter(c => !c.exclude && ['integer','decimal','date','timestamp'].includes(c.type));
+}
+
+function renderFiltersList() {
+  const list = document.getElementById('filtersList');
+  let filters = [];
+  try { filters = JSON.parse(document.getElementById('filtersJson').value || '[]'); } catch (e) {}
+  const cols = eligibleFilterColumns();
+
+  function serialize() {
+    const rows = Array.from(list.querySelectorAll('.filter-row')).map(row => ({
+      column:     row.querySelector('.filter-col').value,
+      operator:   row.querySelector('.filter-op').value,
+      value:      row.querySelector('.filter-val').value,
+      api_param:  row.querySelector('.filter-param').value.trim(),
+      conjunction:'AND',
+    }));
+    document.getElementById('filtersJson').value = JSON.stringify(rows.filter(r => r.column && r.api_param));
+  }
+
+  function addRow(f) {
+    f = f || {};
+    const row = document.createElement('div');
+    row.className = 'filter-row';
+    const colOpts = cols.map(c => `<option value="${c.name}" ${f.column===c.name?'selected':''}>${c.name}</option>`).join('')
+      || '<option value="">— detect columns first —</option>';
+    const opOpts = OPERATORS.map(o => `<option value="${o}" ${f.operator===o?'selected':''}>${o}</option>`).join('');
+    row.innerHTML = `
+      <select class="filter-col">${colOpts}</select>
+      <select class="filter-op">${opOpts}</select>
+      <input class="filter-val" placeholder="value" value="${(f.value||'').toString().replace(/"/g,'&quot;')}" />
+      <span style="font-size:11px;color:#9ca3af;">as API param</span>
+      <input class="filter-param" placeholder="e.g. min_amount" value="${(f.api_param||'').replace(/"/g,'&quot;')}" />
+      <button type="button">&#10005;</button>`;
+    row.querySelectorAll('select, input').forEach(el => el.addEventListener('input', serialize));
+    row.querySelectorAll('select').forEach(el => el.addEventListener('change', serialize));
+    row.querySelector('button').addEventListener('click', () => { row.remove(); serialize(); });
+    list.appendChild(row);
+  }
+
+  list.innerHTML = '';
+  filters.forEach(addRow);
+
+  document.getElementById('addFilterBtn').onclick = () => addRow({});
+}
+renderFiltersList();
+
+function refreshHwmColumnOptions() {
+  const sel = document.getElementById('hwmColumnSelect');
+  if (!sel) return;
+  const current = sel.value;
+  const eligible = eligibleFilterColumns();
+  sel.innerHTML = '<option value="">— none (full reload every run) —</option>' +
+    eligible.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+  if (eligible.some(c => c.name === current)) sel.value = current;
+  renderFiltersList();
+}
+{% if config and config.source.dev.hwm and config.source.dev.hwm.column %}
+(function() {
+  // Deferred until after column detection restores _colData, so the saved
+  // HWM column shows up as soon as it's an eligible option again.
+  const savedHwmCol = {{ config.source.dev.hwm.column | tojson }};
+  const trySet = () => {
+    const sel = document.getElementById('hwmColumnSelect');
+    if (sel && Array.from(sel.options).some(o => o.value === savedHwmCol)) sel.value = savedHwmCol;
+  };
+  document.addEventListener('DOMContentLoaded', trySet);
+  setTimeout(trySet, 300);
+})();
+{% endif %}
+{% if config and config.source.dev.hwm and config.source.dev.hwm.column_datatype %}
+document.getElementById('hwmDatatypeSelect').value = {{ config.source.dev.hwm.column_datatype | tojson }};
+{% endif %}
+
+const ddBody = document.getElementById('ddBody');
+const existingDd = {{ data_dictionary_json | safe }};
+
+const DD_TYPES = ['', 'text', 'integer', 'decimal', 'timestamp', 'boolean', 'date', 'json'];
+const DD_DATE_FORMATS = ['', 'DD/MM/YYYY', 'MM/DD/YYYY', 'YYYY-MM-DD', 'YYYY/MM/DD', 'DD-MM-YYYY',
+  'YYYY-MM-DD HH24:MI:SS', 'DD/MM/YYYY HH24:MI:SS', 'MM/DD/YYYY HH24:MI:SS',
+  'YYYY-MM-DD HH24:MI:SS.MS', 'YYYY-MM-DD HH24:MI:SS.US'];
+const DD_DATE_TYPES = new Set(['date', 'timestamp']);
+
+function toggleFmtCell(dtypeSelect) {
+  const row = dtypeSelect.closest('tr');
+  const sel = row.querySelector('[name="dd_date_fmt[]"]');
+  const isDate = DD_DATE_TYPES.has(dtypeSelect.value);
+  sel.style.display = isDate ? '' : 'none';
+  if (!isDate) sel.value = '';
+}
+
+function escAttr(s) { return String(s || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;'); }
+
+function makeDdRow(col, dtype, desc, dateFmt) {
+  dateFmt = dateFmt || '';
+  const showFmt = DD_DATE_TYPES.has(dtype);
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td><input name="dd_col[]" value="${escAttr(col)}" placeholder="column_name" style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+    <td><select name="dd_dtype[]" style="width:100%;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid #d1d5db;" onchange="toggleFmtCell(this)">
+      ${DD_TYPES.map(t => `<option value="${t}"${dtype===t?' selected':''}>${t||'—'}</option>`).join('')}
+    </select></td>
+    <td><input name="dd_desc[]" value="${escAttr(desc)}" placeholder="Brief description…" style="width:100%;box-sizing:border-box;font-size:12px;" /></td>
+    <td class="dd-fmt-cell">
+      <select name="dd_date_fmt[]" style="width:100%;font-size:11px;padding:3px 6px;border-radius:4px;border:1px solid #d1d5db;display:${showFmt ? '' : 'none'}">
+        ${DD_DATE_FORMATS.map(f => `<option value="${f}"${dateFmt===f?' selected':''}>${f||'—'}</option>`).join('')}
+      </select>
+    </td>
+    <td><button type="button" title="Remove" onclick="this.closest('tr').remove()" style="background:none;border:none;cursor:pointer;color:#dc2626;font-size:17px;line-height:1;">&#215;</button></td>
+  `;
+  return tr;
+}
+
+const PIPELINE_META_COLS = new Set([
+  '_pipeline_inserted_at', '_pipeline_run_id', '_source_system',
+  '_loaded_at', '_row_checksum', '_source_file', '_file_checksum',
+]);
+
+Object.entries(existingDd).forEach(([col, info]) => {
+  if (PIPELINE_META_COLS.has(col)) return;
+  const desc    = typeof info === 'string' ? info : (info.description || '');
+  const dtype   = (info && typeof info === 'object') ? (info.dtype || '') : '';
+  const dateFmt = (info && typeof info === 'object') ? (info.date_format || '') : '';
+  ddBody.appendChild(makeDdRow(col, dtype, desc, dateFmt));
+});
+
+// Detected/edited columns (Step 3) are the source of truth for what actually
+// gets saved into data_dictionary — add a row here for any of them that
+// doesn't have one yet, so the user never has to retype a column name that
+// was just detected just to describe it.
+function syncDdFromColumns() {
+  const existingNames = new Set(
+    Array.from(ddBody.querySelectorAll('[name="dd_col[]"]')).map(inp => inp.value.trim())
+  );
+  _colData.forEach(ca => {
+    const name = (ca.name || '').trim();
+    if (!name || ca.exclude || existingNames.has(name)) return;
+    ddBody.appendChild(makeDdRow(name, ca.type || '', '', ca.format || ''));
+    existingNames.add(name);
+  });
+}
+
+document.getElementById('addDdRow').addEventListener('click', () => {
+  ddBody.appendChild(makeDdRow('', '', ''));
+  ddBody.lastElementChild.querySelector('input').focus();
+});
+
+document.getElementById('suggestTableDescBtn').addEventListener('click', async () => {
+  const statusEl = document.getElementById('tableDescStatus');
+  const dagId = (document.querySelector('[name=dag_id]') || {}).value || '';
+  const cols = Array.from(document.querySelectorAll('[name="dd_col[]"]')).map(i => i.value.trim()).filter(Boolean);
+  statusEl.style.color = '#6b7a90'; statusEl.textContent = '⏳ Asking AI…';
+  try {
+    const resp = await fetch('/api/suggest-descriptions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({columns: cols, table: dagId, describe_table: true}),
+    });
+    const data = await resp.json();
+    if (data.error) { statusEl.style.color='#b91c1c'; statusEl.textContent='✗ '+data.error; return; }
+    if (data.table_description) {
+      document.getElementById('tableDescInput').value = data.table_description;
+      statusEl.style.color = '#15803d'; statusEl.textContent = '✓ Table description filled';
+    } else {
+      statusEl.style.color = '#b45309'; statusEl.textContent = '⚠ No description returned';
+    }
+  } catch(e) { statusEl.style.color='#b91c1c'; statusEl.textContent='✗ '+e.message; }
+});
+
+document.getElementById('suggestAiBtn').addEventListener('click', async () => {
+  const colInputs = Array.from(document.querySelectorAll('[name="dd_col[]"]'));
+  const cols = colInputs.map(i => i.value.trim()).filter(Boolean);
+  const statusEl = document.getElementById('aiStatus');
+  if (!cols.length) { statusEl.style.color = '#b45309'; statusEl.textContent = '⚠ Add column names first, then click Suggest.'; return; }
+  const dagId = (document.querySelector('[name=dag_id]') || {}).value || '';
+  statusEl.style.color = '#6b7a90'; statusEl.textContent = '⏳ Asking AI…';
+  try {
+    const resp = await fetch('/api/suggest-descriptions', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({columns: cols, table: dagId}),
+    });
+    const data = await resp.json();
+    if (data.error) { statusEl.style.color = '#b91c1c'; statusEl.textContent = '✗ ' + data.error; return; }
+    colInputs.forEach(inp => {
+      const col = inp.value.trim();
+      const suggestion = data.suggestions[col];
+      if (suggestion) {
+        const row     = inp.closest('tr');
+        const desc    = typeof suggestion === 'string' ? suggestion : (suggestion.description || '');
+        const dtype   = typeof suggestion === 'object' ? (suggestion.dtype || '') : '';
+        const dateFmt = typeof suggestion === 'object' ? (suggestion.date_format || '') : '';
+        row.querySelector('[name="dd_desc[]"]').value = desc;
+        const dtypeSel = row.querySelector('[name="dd_dtype[]"]');
+        if (dtype) { dtypeSel.value = dtype; toggleFmtCell(dtypeSel); }
+        if (dateFmt) { const fmtSel = row.querySelector('[name="dd_date_fmt[]"]'); if (fmtSel) fmtSel.value = dateFmt; }
+      }
+    });
+    statusEl.style.color = '#15803d'; statusEl.textContent = '✓ Descriptions & types updated';
+  } catch (e) { statusEl.style.color = '#b91c1c'; statusEl.textContent = '✗ ' + e.message; }
+});
+
+
+// ── Cleaning step rendering ────────────────────────────────────────────────────
+
+function buildAutoSqlLines() {
+  const schemaEl       = document.getElementById('devTargetSchema');
+  const targetSchema   = schemaEl ? schemaEl.value.trim() : '';
+  const tblEl          = document.getElementById('devTargetTable');
+  const targetTable    = tblEl ? tblEl.value.trim() : '';
+  // Cleaning rules run against refined (not raw — raw must stay an
+  // untouched, permanent copy of exactly what was ingested). Refined
+  // lives in the shared "pipeline" schema, table-prefixed with the
+  // target schema so different targets never collide.
+  const refinedTableRef = 'pipeline.' + (targetSchema || 'schema') + '_' + (targetTable || 'table') + '_refined';
+
+  const RULE_ORDER = ['trim','strip_suffix','strip_separators','remove_special','titlecase','upper','lower','null_invalid','null_empty'];
+  const RULE_SQL   = {
+    trim:             e => `TRIM(${e})`,
+    strip_suffix:     e => `TRIM(REGEXP_REPLACE(${e}, '\\[[A-Za-z]{2}-[A-Za-z]{2}\\]', '', 'g'))`,
+    strip_separators: e => `TRIM(SPLIT_PART(REGEXP_REPLACE(REGEXP_REPLACE(REGEXP_REPLACE(${e}, '[,|]', ' ', 'g'), '[-_/]', ' ', 'g'), '\\s+', ' ', 'g'), ' ', 1))`,
+    remove_special:   e => `regexp_replace(${e}, '[^a-zA-Z0-9 ]', '', 'g')`,
+    titlecase:        e => `INITCAP(${e})`,
+    upper:            e => `UPPER(${e})`,
+    lower:            e => `LOWER(${e})`,
+    null_invalid:     e => `CASE WHEN ${e} IN ('-1', '') OR ${e} ~ '^[0-9]+$' OR LENGTH(${e}) < 3 OR ${e} ~ '^[^a-zA-Z]' THEN NULL ELSE ${e} END`,
+    null_empty:       e => `NULLIF(${e}, '')`,
+  };
+
+  const lines = [];
+  _colData.forEach(ca => {
+    if (ca.exclude || !ca.rules || !ca.rules.length) return;
+    let expr = ca.name;
+    RULE_ORDER.forEach(rule => {
+      if (ca.rules.includes(rule)) expr = RULE_SQL[rule](expr);
+    });
+    if (expr !== ca.name) lines.push(`UPDATE ${refinedTableRef} SET ${ca.name} = ${expr};`);
+  });
+  return lines;
+}
+
+function updateAutoSql() {
+  const lines = buildAutoSqlLines();
+  const pre   = document.getElementById('autoSqlPreview');
+  const cnt   = document.getElementById('autoSqlCount');
+  if (!pre) return;
+  if (lines.length) {
+    pre.textContent = lines.join('\n');
+    if (cnt) cnt.textContent = `(${lines.length} statement${lines.length > 1 ? 's' : ''})`;
+  } else {
+    pre.textContent = 'No column rules selected yet — go to Step 3 to add cleaning rules.';
+    if (cnt) cnt.textContent = '';
+  }
+}
+
+function renderCleaningStep() {
+  const enabled  = document.getElementById('enableCleaning').checked;
+  document.getElementById('cleaningOffNote').style.display  = enabled ? 'none' : '';
+  document.getElementById('cleaningOnPanel').style.display  = enabled ? ''     : 'none';
+  if (enabled) updateAutoSql();
+}
+
+function addManualSqlRow() {
+  const list = document.getElementById('manualSqlList');
+  const row  = document.createElement('div');
+  row.className = 'manual-sql-row';
+  row.innerHTML = `<textarea name="manual_sql_query[]" placeholder="UPDATE pipeline.schema_table_refined SET col = INITCAP(TRIM(col));"></textarea>
+    <button type="button" onclick="this.parentElement.remove();">&#10005;</button>`;
+  list.appendChild(row);
+}
+
+// Also update auto SQL when target table or schema changes
+document.getElementById('devTargetSchema').addEventListener('input', updateAutoSql);
+document.getElementById('devTargetTable').addEventListener('input', updateAutoSql);
+
+// ── Review step ────────────────────────────────────────────────────────────────
+
+function buildReview() {
+  const srcType   = document.getElementById('sourceTypeInput').value || 'file';
+  const filename  = (document.getElementById('sampleFileInput')||{}).value || '—';
+  const dagId     = (document.getElementById('dagIdInput')||{}).value || '—';
+  const dagPrefix = srcType === 'api' ? 'api_' : 'hybrid_';
+  const sched     = (document.getElementById('scheduleInterval')||{}).value || '—';
+  const devSchema = (document.getElementById('devTargetSchema')||{}).value || '—';
+  const devTbl    = (document.getElementById('devTargetTable')||{}).value || '—';
+  const devConn   = (document.getElementById('devTargetConn')||{}).value || '—';
+  const cleaning  = document.getElementById('enableCleaning').checked;
+  const autoLines = buildAutoSqlLines();
+  const manualQs  = document.querySelectorAll('[name="manual_sql_query[]"]');
+  const manualCnt = Array.from(manualQs).filter(t => t.value.trim()).length;
+  const colCount  = _colData.filter(c => !c.exclude).length;
+  const ruleCount = _colData.filter(c => !c.exclude && c.rules && c.rules.length).length;
+
+  let sourceLine;
+  if (srcType === 'api') {
+    const urlMode  = (document.getElementById('urlModeInput')||{}).value || 'separate';
+    const pagStrat = (document.getElementById('paginationStrategy')||{}).value || 'none';
+    const hwmCol   = (document.getElementById('hwmColumnSelect')||{}).value || '';
+    let filters = []; try { filters = JSON.parse(document.getElementById('filtersJson').value || '[]'); } catch(e){}
+    const urlLine = urlMode === 'full'
+      ? '&#127760; API &mdash; full URL (encrypted, token embedded)'
+      : '&#127760; API &mdash; ' + ((document.getElementById('baseUrlInput')||{}).value || '—') +
+        '<br><b>Auth:</b> ' + ((document.getElementById('authTypeSelect')||{}).value || 'none');
+    sourceLine =
+      urlLine + '<br>' +
+      '<b>Pagination:</b> ' + pagStrat + '<br>' +
+      '<b>Filters:</b> ' + filters.length + '<br>' +
+      '<b>Incremental (HWM):</b> ' + (hwmCol ? hwmCol : 'off — full reload every run');
+  } else if (srcType === 'db') {
+    sourceLine = '&#128421; Database';
+  } else {
+    sourceLine = '&#128196; File &mdash; ' + filename;
+  }
+
+  document.getElementById('reviewSummary').innerHTML =
+    '<b>DAG ID:</b> ' + dagPrefix + '&lt;conn&gt;_' + dagId + '<br>' +
+    '<b>Pipeline type:</b> Hybrid &#9889; (3-stage)<br>' +
+    '<b>Source:</b> ' + sourceLine + '<br>' +
+    '<b>Schedule:</b> ' + sched + '<br>' +
+    '<b>Columns:</b> ' + colCount + ' included' + (ruleCount ? ', ' + ruleCount + ' with cleaning rules' : '') + '<br>' +
+    '<b>Raw (permanent):</b> raw.' + devSchema + '_' + devTbl + '_raw<br>' +
+    '<b>Refined:</b> pipeline.' + devSchema + '_' + devTbl + '_refined<br>' +
+    '<b>DW target:</b> ' + devConn + ' &rarr; ' + devTbl + '<br>' +
+    '<b>Cleaning:</b> ' + (cleaning
+      ? '&#9989; Enabled &mdash; ' + autoLines.length + ' auto + ' + manualCnt + ' manual SQL statement(s)'
+      : '&#128994; Off &mdash; raw &rarr; refined copy only') + '<br>';
+}
+
+// ── Validate before save ───────────────────────────────────────────────────────
+
+document.getElementById('hybridForm').addEventListener('submit', function(e) {
+  const dagId = (document.getElementById('dagIdInput')||{}).value.trim();
+  if (!dagId) {
+    e.preventDefault();
+    const banner = document.getElementById('saveErrorBanner');
+    banner.textContent = 'DAG ID is required.';
+    banner.style.display = 'block';
+    current = 1; renderStep();
+  }
+});
+
+// ── Cleaning script selector ───────────────────────────────────────────────────
+
+async function populateScriptDropdown() {
+  const sel = document.getElementById('cleaningScriptSelect');
+  if (!sel) return;
+  const previousValue = sel.value;
+  try {
+    const res  = await fetch('/api/cleaning-scripts');
+    const data = await res.json();
+    // Keep the "— no script —" option; remove any previously fetched options
+    while (sel.options.length > 1) sel.remove(1);
+    (data.scripts || []).forEach(name => {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === previousValue) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    // If editing an existing config, restore saved value and load its functions
+    {% if config and config.cleaning and config.cleaning.script_path %}
+    const saved = {{ config.cleaning.script_path | tojson }};
+    if (saved && !previousValue) {
+      sel.value = saved;
+      if (sel.value === saved) loadScriptFunctions(saved);
+    }
+    {% endif %}
+  } catch (err) {
+    console.warn('Could not load cleaning scripts:', err);
+  }
+}
+
+async function loadScriptFunctions(scriptName) {
+  const listDiv      = document.getElementById('functionList');
+  const checkboxDiv  = document.getElementById('functionCheckboxes');
+  const emptyNote    = document.getElementById('functionEmptyNote');
+  const statusEl     = document.getElementById('scriptLoadStatus');
+
+  listDiv.style.display    = 'none';
+  emptyNote.style.display  = 'none';
+  checkboxDiv.innerHTML    = '';
+  if (statusEl) statusEl.textContent = '';
+
+  if (!scriptName) return;
+
+  if (statusEl) statusEl.textContent = 'Loading functions…';
+  try {
+    const res  = await fetch('/api/cleaning-functions?script=' + encodeURIComponent(scriptName));
+    const data = await res.json();
+    const fns  = data.functions || [];
+    if (statusEl) statusEl.textContent = '';
+
+    if (fns.length === 0) {
+      emptyNote.style.display = '';
+      return;
+    }
+
+    {% set saved_fns = (config.cleaning.functions if config and config.cleaning and config.cleaning.functions else []) %}
+    const savedFns = {{ saved_fns | tojson }};
+
+    fns.forEach(fn => {
+      const label = document.createElement('label');
+      label.style.cssText = 'display:flex;align-items:flex-start;gap:8px;cursor:pointer;font-size:12px;';
+      const cb = document.createElement('input');
+      cb.type  = 'checkbox';
+      cb.name  = 'cleaning_function[]';
+      cb.value = fn;
+      cb.style.marginTop = '2px';
+      if (savedFns.includes(fn)) cb.checked = true;
+      const span = document.createElement('span');
+      span.innerHTML = '<code style="font-size:11px;background:#f3f4f6;padding:1px 5px;border-radius:4px;">' +
+                       fn + '</code>';
+      label.appendChild(cb);
+      label.appendChild(span);
+      checkboxDiv.appendChild(label);
+    });
+
+    listDiv.style.display = '';
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Error loading functions.';
+    console.warn('Could not load functions:', err);
+  }
+}
+
+// ── Initial render ─────────────────────────────────────────────────────────────
+renderStep();
+updateSchemaPreview();
+renderCleaningStep();
+populateScriptDropdown();
+refreshHwmColumnOptions();
+</script>
+</body>
+</html>
